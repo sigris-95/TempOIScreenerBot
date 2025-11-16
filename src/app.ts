@@ -30,6 +30,8 @@ export class PumpScoutBot {
 
       this.commandHandler.initialize(); // <-- Раскомментировали
 
+      this.telegramBotService.sendMessage(5200245605, 'Bot started')
+
       this.logger.info('Pump Scout Bot started successfully!');
     } catch (error) {
       this.logger.error('Failed to initialize Pump Scout Bot:', error);
