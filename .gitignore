@@ -1,0 +1,7 @@
+/node_modules
+/database.sqlite
+/package-lock.json
+/combined.log
+/error.log
+.env
+/dist

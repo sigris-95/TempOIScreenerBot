@@ -1,0 +1,2324 @@
+﻿================================================================================
+  PUMP SCOUT BOT - Project full code collection
+  DATA: 2025-11-16 11:12:23
+  ISKLYUCHENO: src/generated
+================================================================================
+
+
+========================================================================
+  FILE: src/app.container.ts
+========================================================================
+
+import { DIContainer } from './shared/container';
+import { SignalRepository } from './infrastructure/repositories/signal.repository';
+import { SymbolMetadataRepository } from './infrastructure/repositories/symbol-metadata.repository';
+import { TriggerRepository } from './infrastructure/repositories/trigger.repository';
+
+import { DataAggregatorService } from './infrastructure/services/data-aggregator.service';
+import { BinanceWebSocketService } from './infrastructure/services/binance-websocket.service';
+import { NotificationService } from './infrastructure/services/notification.service';
+import { TriggerEngineService } from './infrastructure/services/trigger-engine.service';
+
+import { BinanceApiClient } from './infrastructure/http/binance-api.client';
+import { TelegramBotService } from './infrastructure/telegram/telegram.bot';
+import { CommandHandler } from './presentation/telegram/handlers/command.handler';
+import { SignalHandler } from './presentation/telegram/handlers/signal.handler';
+import { PumpScoutBot } from './app';
+
+import { CreateTriggerUseCase } from './application/use-cases/create-trigger.use-case';
+import { GetTriggersUseCase } from './application/use-cases/get-triggers.use-case';
+import { RemoveTriggerUseCase } from './application/use-cases/remove-trigger.use-case';
+
+export function registerDependencies(): void {
+  const container = DIContainer.getInstance();
+
+  // --- Register Repositories ---
+  container.bind('ITriggerRepository', () => new TriggerRepository());
+  container.bind('ISignalRepository', () => new SignalRepository());
+  container.bind('ISymbolMetadataRepository', () => new SymbolMetadataRepository());
+
+  // --- Register Use Cases ---
+  container.bind(
+    CreateTriggerUseCase,
+    () => new CreateTriggerUseCase(container.get('ITriggerRepository')),
+  );
+  container.bind(
+    GetTriggersUseCase,
+    () => new GetTriggersUseCase(container.get('ITriggerRepository')),
+  );
+  container.bind(
+    RemoveTriggerUseCase,
+    () => new RemoveTriggerUseCase(container.get('ITriggerRepository')),
+  );
+
+  // --- Register Core Services & Handlers (в порядке зависимостей) ---
+  container.bind('IDataAggregatorService', () => new DataAggregatorService());
+  container.bind(
+    'IMarketDataGateway',
+    () => new BinanceWebSocketService(container.get('IDataAggregatorService')),
+  );
+  container.bind(
+    TelegramBotService,
+    () => new TelegramBotService(process.env.TELEGRAM_BOT_TOKEN || ''),
+  );
+  container.bind(
+    SignalHandler,
+    () => new SignalHandler(container.get(TelegramBotService), container.get('ISignalRepository')),
+  );
+  container.bind(
+    'INotificationService',
+    () =>
+      new NotificationService(
+        container.get(SignalHandler),
+        container.get('ISignalRepository'),
+      ),
+  );
+  container.bind(
+    'ITriggerEngineService',
+    () =>
+      new TriggerEngineService(
+        container.get('ITriggerRepository'),
+        container.get('IDataAggregatorService'),
+        container.get('INotificationService'),
+      ),
+  );
+  container.bind(BinanceApiClient, () => new BinanceApiClient());
+
+  // --- Register Telegram Command Handler ---
+  container.bind(
+    CommandHandler,
+    () =>
+      new CommandHandler(
+        container.get(TelegramBotService),
+        container.get(CreateTriggerUseCase),
+        container.get(GetTriggersUseCase),
+        container.get(RemoveTriggerUseCase),
+      ),
+  );
+
+  // --- Register Main App ---
+  container.bind(
+    PumpScoutBot,
+    () =>
+      new PumpScoutBot(
+        container.get('IMarketDataGateway'),
+        container.get('ITriggerEngineService'),
+        container.get(TelegramBotService),
+        container.get('ITriggerRepository'),
+        container.get(CommandHandler),
+      ),
+  );
+}
+
+
+========================================================================
+  FILE: src/app.ts
+========================================================================
+
+import { Inject, Injectable } from './shared/decorators';
+import { Logger } from './shared/logger';
+import { IMarketDataGateway, ITriggerEngineService } from './domain/interfaces/services.interface';
+import { TelegramBotService } from './infrastructure/telegram/telegram.bot';
+import { ITriggerRepository } from './domain/interfaces/repositories.interface';
+import { CommandHandler } from './presentation/telegram/handlers/command.handler';
+
+@Injectable()
+export class PumpScoutBot {
+  private readonly logger = new Logger(PumpScoutBot.name);
+
+  constructor(
+    @Inject('IMarketDataGateway') private readonly marketDataGateway: IMarketDataGateway,
+    @Inject('ITriggerEngineService') private readonly triggerEngine: ITriggerEngineService,
+    private readonly telegramBotService: TelegramBotService,
+    @Inject('ITriggerRepository') private readonly triggerRepository: ITriggerRepository,
+    private readonly commandHandler: CommandHandler, // <-- Раскомментировали
+  ) {}
+
+  public async start(): Promise<void> {
+    this.logger.info('Initializing Pump Scout Bot...');
+    try {
+      await this.triggerRepository.init();
+      this.logger.info(
+        `Trigger repository initialized with ${this.triggerRepository.getAllActive().length} active triggers.`,
+      );
+
+      await this.marketDataGateway.connect();
+      this.triggerEngine.start();
+
+      this.commandHandler.initialize(); // <-- Раскомментировали
+
+      this.logger.info('Pump Scout Bot started successfully!');
+    } catch (error) {
+      this.logger.error('Failed to initialize Pump Scout Bot:', error);
+      throw error;
+    }
+  }
+
+  public async stop(): Promise<void> {
+    this.logger.info('Stopping Pump Scout Bot...');
+    this.triggerEngine.stop();
+    await this.marketDataGateway.disconnect();
+    await this.telegramBotService.stop();
+    this.logger.info('Pump Scout Bot stopped gracefully.');
+  }
+}
+
+
+========================================================================
+  FILE: src/main.ts
+========================================================================
+
+import 'reflect-metadata';
+import { config } from 'dotenv';
+import { DIContainer } from './shared/container';
+import { DatabaseModule } from './infrastructure/database/database.module';
+import { Logger } from './shared/logger';
+import { registerDependencies } from './app.container';
+
+// Load environment variables
+config();
+
+// Import all necessary classes to ensure decorators are executed
+import './infrastructure/repositories/signal.repository';
+import './infrastructure/repositories/symbol-metadata.repository';
+import './infrastructure/services/binance-websocket.service';
+import './infrastructure/telegram/telegram.bot';
+import './infrastructure/http/binance-api.client';
+import './presentation/telegram/handlers/command.handler';
+import './presentation/telegram/handlers/signal.handler';
+
+import { PumpScoutBot } from './app';
+
+const logger = new Logger('Main');
+
+process.on('uncaughtException', (error) => {
+  logger.error('Uncaught Exception:', error);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('Unhandled Rejection at:', `promise: ${promise}, reason: ${reason}`);
+  process.exit(1);
+});
+
+async function bootstrap(): Promise<void> {
+  try {
+    logger.info('Starting Pump Scout Bot...');
+
+    // Register all dependencies
+    registerDependencies();
+
+    // Initialize database
+    await DatabaseModule.initialize();
+
+    // Start the application
+    const app: PumpScoutBot = DIContainer.getInstance().get<PumpScoutBot>(PumpScoutBot);
+    await app.start();
+
+    logger.info('Pump Scout Bot started successfully');
+
+    // Graceful shutdown
+    let isShuttingDown = false; // prevent double shutdown
+    const shutdown = async (signal: string): Promise<void> => {
+      if (isShuttingDown) return;
+      isShuttingDown = true;
+      logger.info(`Received ${signal}, shutting down gracefully...`);
+      try {
+        await app.stop();
+      } finally {
+        await DatabaseModule.close();
+        process.exit(0);
+      }
+    };
+
+    // Use .once to avoid multiple handler invocations
+    process.once('SIGINT', () => shutdown('SIGINT'));
+    process.once('SIGTERM', () => shutdown('SIGTERM'));
+  } catch (error) {
+    logger.error('Failed to start application:', error);
+    await DatabaseModule.close();
+    process.exit(1);
+  }
+}
+
+bootstrap();
+
+
+========================================================================
+  FILE: src/application/dto/create-trigger.dto.ts
+========================================================================
+
+import { IsInt, IsNumber, IsPositive, Min, Max, IsIn } from 'class-validator';
+import { Direction } from '../../domain/types/direction.type';
+
+export class CreateTriggerDto {
+  userId!: number;
+
+  @IsIn(['up', 'down'])
+  direction!: Direction;
+
+  @IsNumber({}, { message: 'Процент изменения ОИ должен быть числом' })
+  @IsPositive({ message: 'Процент изменения ОИ должен быть положительным' })
+  @Min(0.1)
+  @Max(100)
+  oiChangePercent!: number;
+
+  @IsInt({ message: 'Интервал должен быть целым числом' })
+  @IsPositive({ message: 'Интервал должен быть положительным' })
+  @Min(1)
+  @Max(30)
+  timeIntervalMinutes!: number;
+
+  @IsInt({ message: 'Лимит уведомлений должен быть целым числом' })
+  @IsPositive({ message: 'Лимит уведомлений должен быть положительным' })
+  @Min(10)
+  notificationLimitSeconds!: number;
+}
+
+
+========================================================================
+  FILE: src/application/dto/signal.dto.ts
+========================================================================
+
+export type SignalQuality = 'weak' | 'medium' | 'strong';
+
+export class SignalDto {
+  constructor(
+    public readonly signalNumber: number,
+    public readonly symbol: string,
+    public readonly priceChangePercent: number,
+    public readonly oiGrowthPercent: number,
+    public readonly deltaPercent: number,
+    public readonly currentPrice: number,
+    public readonly timestamp: Date,
+    public readonly quality: SignalQuality,
+    public readonly triggerIntervalMinutes?: number,
+  ) {}
+}
+
+
+========================================================================
+  FILE: src/application/use-cases/create-trigger.use-case.ts
+========================================================================
+
+import { Inject, Injectable } from '../../shared/decorators';
+import { ITriggerRepository } from '../../domain/interfaces/repositories.interface';
+import { Trigger } from '../../domain/entities/trigger.entity';
+import { CreateTriggerDto } from '../dto/create-trigger.dto';
+
+@Injectable()
+export class CreateTriggerUseCase {
+  constructor(
+    @Inject('ITriggerRepository')
+    private readonly triggerRepository: ITriggerRepository,
+  ) {}
+
+  public async execute(dto: CreateTriggerDto): Promise<Trigger> {
+    // Здесь можно добавить бизнес-логику, например, проверку,
+    // не превысил ли пользователь лимит на количество триггеров.
+    return this.triggerRepository.save(dto);
+  }
+}
+
+
+========================================================================
+  FILE: src/application/use-cases/get-triggers.use-case.ts
+========================================================================
+
+import { Inject, Injectable } from '../../shared/decorators';
+import { ITriggerRepository } from '../../domain/interfaces/repositories.interface';
+import { Trigger } from '../../domain/entities/trigger.entity';
+
+@Injectable()
+export class GetTriggersUseCase {
+  constructor(
+    @Inject('ITriggerRepository')
+    private readonly triggerRepository: ITriggerRepository,
+  ) {}
+
+  public async execute(userId: number): Promise<Trigger[]> {
+    return this.triggerRepository.findByUserId(userId);
+  }
+}
+
+
+========================================================================
+  FILE: src/application/use-cases/remove-trigger.use-case.ts
+========================================================================
+
+import { Inject, Injectable } from '../../shared/decorators';
+import { ITriggerRepository } from '../../domain/interfaces/repositories.interface';
+
+@Injectable()
+export class RemoveTriggerUseCase {
+  constructor(
+    @Inject('ITriggerRepository')
+    private readonly triggerRepository: ITriggerRepository,
+  ) {}
+
+  public async execute(id: number, userId: number): Promise<boolean> {
+    return this.triggerRepository.remove(id, userId);
+  }
+}
+
+
+========================================================================
+  FILE: src/domain/entities/signal.entity.ts
+========================================================================
+
+import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, Index } from 'typeorm';
+
+@Entity('signals')
+export class Signal {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @Column({ type: 'integer' })
+  @Index()
+  signalNumber!: number;
+
+  @Column({ type: 'varchar' })
+  symbol!: string;
+
+  @Column({ name: 'price_change_percent', type: 'decimal', precision: 10, scale: 4 })
+  priceChangePercent!: number;
+
+  @Column({ type: 'decimal', precision: 10, scale: 4 })
+  oiGrowthPercent!: number;
+
+  @Column({ type: 'decimal', precision: 10, scale: 4 })
+  deltaPercent!: number;
+
+  @Column({ type: 'decimal', precision: 15, scale: 8 })
+  currentPrice!: number;
+
+  @CreateDateColumn()
+  @Index()
+  createdAt!: Date;
+}
+
+
+========================================================================
+  FILE: src/domain/entities/symbol-metadata.entity.ts
+========================================================================
+
+import { Entity, PrimaryColumn, Column, CreateDateColumn, UpdateDateColumn } from 'typeorm';
+
+@Entity('symbol_metadata')
+export class SymbolMetadata {
+  @PrimaryColumn({ type: 'varchar' })
+  symbol!: string;
+
+  @Column({ type: 'decimal', precision: 20, scale: 8, default: 0 })
+  baseVolume!: number;
+
+  @Column({ type: 'decimal', precision: 20, scale: 8, default: 0 })
+  quoteVolume!: number;
+
+  @Column({ type: 'decimal', precision: 20, scale: 8, default: 0 })
+  openInterest!: number;
+
+  @Column({ type: 'boolean', default: true })
+  isActive!: boolean;
+
+  @CreateDateColumn()
+  createdAt!: Date;
+
+  @UpdateDateColumn()
+  updatedAt!: Date;
+}
+
+
+========================================================================
+  FILE: src/domain/entities/trigger.entity.ts
+========================================================================
+
+import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, Index } from 'typeorm';
+import { Direction } from '../types/direction.type';
+
+@Entity('triggers')
+export class Trigger {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @Index()
+  @Column({ name: 'user_id', type: 'integer' })
+  userId!: number;
+
+  @Column({ type: 'text' })
+  direction!: Direction;
+
+  @Column({ name: 'oi_change_percent', type: 'real' })
+  oiChangePercent!: number;
+
+  @Column({ name: 'time_interval_minutes', type: 'integer' })
+  timeIntervalMinutes!: number;
+
+  @Column({ name: 'notification_limit_seconds', type: 'integer' })
+  notificationLimitSeconds!: number;
+
+  @Column({ name: 'is_active', type: 'boolean', default: true })
+  isActive!: boolean;
+
+  @CreateDateColumn({ name: 'created_at', type: 'datetime' })
+  createdAt!: Date;
+}
+
+
+========================================================================
+  FILE: src/domain/interfaces/repositories.interface.ts
+========================================================================
+
+// src/domain/interfaces/repositories.interface.ts
+
+import { Signal } from '../entities/signal.entity';
+import { SymbolMetadata } from '../entities/symbol-metadata.entity';
+import { Trigger } from '../entities/trigger.entity';
+import { CreateTriggerDto } from '../../application/dto/create-trigger.dto';
+
+export interface ITriggerRepository {
+  init(): Promise<void>;
+  getAllActive(): Trigger[];
+  findByUserId(userId: number): Promise<Trigger[]>;
+  save(dto: CreateTriggerDto): Promise<Trigger>;
+  remove(id: number, userId: number): Promise<boolean>;
+}
+
+export interface ISignalRepository {
+  getLast24HoursSignalCount(userId: number): Promise<number>;
+  getLast24HoursSignalCountBySymbol(userId: number, symbol: string): Promise<number>;
+  save(signal: Signal): Promise<Signal>;
+  findRecentBySymbol(symbol: string, hours: number): Promise<Signal[]>;
+}
+
+export interface ISymbolMetadataRepository {
+  findAllActive(): Promise<SymbolMetadata[]>;
+  findBySymbol(symbol: string): Promise<SymbolMetadata | null>;
+  save(metadata: SymbolMetadata): Promise<SymbolMetadata>;
+  updateActiveSymbols(symbols: string[]): Promise<void>;
+}
+
+
+========================================================================
+  FILE: src/domain/interfaces/services.interface.ts
+========================================================================
+
+import { Trigger } from '../entities/trigger.entity';
+
+export interface IDataPoint {
+  readonly timestamp: number;
+  readonly price: number;
+  readonly openInterest: number;
+}
+
+export interface IMetricChanges {
+  readonly priceChangePercent: number;
+  readonly oiChangePercent: number;
+  readonly currentPrice: number;  // NEW: Include current price in metrics
+  readonly currentOI: number;      // NEW: Include current OI in metrics
+}
+
+export interface IDataAggregatorService {
+  updatePrice(symbol: string, price: number, timestamp: number): void;
+  updateOpenInterest(symbol: string, openInterest: number, timestamp: number): void;
+  getMetricChanges(symbol: string, timeIntervalMinutes: number): IMetricChanges | null;
+  getAllKnownSymbols(): string[];
+  getHistoryLength(symbol: string): number;
+}
+
+export interface IMarketDataGateway {
+  connect(): Promise<void>;
+  disconnect(): Promise<void>;
+}
+
+export interface ITriggerEngineService {
+  start(): void;
+  stop(): void;
+}
+
+export interface INotificationService {
+  processTrigger(trigger: Trigger, symbol: string, metrics: IMetricChanges): Promise<void>;
+}
+
+
+========================================================================
+  FILE: src/domain/types/direction.type.ts
+========================================================================
+
+export type Direction = 'up' | 'down';
+
+
+========================================================================
+  FILE: src/infrastructure/database/database.module.ts
+========================================================================
+
+import { DataSource } from 'typeorm';
+import { Signal } from '../../domain/entities/signal.entity';
+import { SymbolMetadata } from '../../domain/entities/symbol-metadata.entity';
+import { Trigger } from '../../domain/entities/trigger.entity';
+import { Logger } from '../../shared/logger';
+
+const logger = new Logger('DatabaseModule');
+
+export const AppDataSource = new DataSource({
+  type: 'sqlite',
+  database: 'database.sqlite',
+  synchronize: true, // Для разработки. В продакшене лучше использовать миграции.
+  logging: false,
+  entities: [Trigger, Signal, SymbolMetadata],
+  migrations: [],
+  subscribers: [],
+});
+
+export class DatabaseModule {
+  static async initialize(): Promise<void> {
+    try {
+      await AppDataSource.initialize();
+      logger.info('Database connection established');
+    } catch (error) {
+      logger.error('Database connection failed:', error);
+      throw error;
+    }
+  }
+
+  static async close(): Promise<void> {
+    if (AppDataSource.isInitialized) {
+      await AppDataSource.destroy();
+    }
+  }
+}
+
+
+========================================================================
+  FILE: src/infrastructure/http/binance-api.client.ts
+========================================================================
+
+import { Injectable } from '../../shared/decorators';
+import { Logger } from '../../shared/logger';
+
+interface BinanceExchangeInfo {
+  symbols: Array<{
+    symbol: string;
+    status: string;
+    baseAsset: string;
+    quoteAsset: string;
+    contractType: string;
+  }>;
+}
+
+interface BinanceOpenInterest {
+  symbol: string;
+  openInterest: string;
+}
+
+@Injectable()
+export class BinanceApiClient {
+  private readonly baseUrl = 'https://fapi.binance.com';
+  private readonly logger = new Logger(BinanceApiClient.name);
+  private requestQueue: Array<() => Promise<any>> = [];
+  private isProcessing = false;
+  private readonly RPS_LIMIT = 3;
+  private lastRequestTime = 0;
+
+  constructor() {
+    this.logger.info('BinanceApiClient initialized');
+    this.processQueue();
+  }
+
+  async getUsdtPairs(): Promise<string[]> {
+    try {
+      this.logger.info('Fetching USDT pairs from Binance...');
+      const exchangeInfo = await this.makeRequest<BinanceExchangeInfo>('/fapi/v1/exchangeInfo');
+
+      const pairs = exchangeInfo.symbols
+        .filter(
+          (symbol) =>
+            symbol.status === 'TRADING' &&
+            symbol.quoteAsset === 'USDT' &&
+            symbol.contractType === 'PERPETUAL',
+        )
+        .map((symbol) => symbol.symbol);
+
+      this.logger.info(`Found ${pairs.length} active USDT pairs`);
+      return pairs;
+    } catch (error) {
+      this.logger.error('Failed to get USDT pairs:', error);
+      // Fallback to major pairs
+      return [
+        'BTCUSDT',
+        'ETHUSDT',
+        'BNBUSDT',
+        'ADAUSDT',
+        'XRPUSDT',
+        'SOLUSDT',
+        'DOTUSDT',
+        'DOGEUSDT',
+        'AVAXUSDT',
+        'MATICUSDT',
+        'LTCUSDT',
+        'LINKUSDT',
+        'ATOMUSDT',
+        'XLMUSDT',
+        'BCHUSDT',
+      ];
+    }
+  }
+
+  async getOpenInterest(symbol: string): Promise<number> {
+    try {
+      const data = await this.makeRequest<BinanceOpenInterest>('/fapi/v1/openInterest', { symbol });
+      return parseFloat(data.openInterest);
+    } catch (error) {
+      this.logger.error(`Failed to get open interest for ${symbol}:`, error);
+      return 0;
+    }
+  }
+
+  async getTopSymbolsByOI(limit: number = 50): Promise<string[]> {
+    this.logger.info(`Getting top ${limit} symbols by Open Interest...`);
+
+    try {
+      const allSymbols = await this.getUsdtPairs();
+
+      if (allSymbols.length === 0) {
+        throw new Error('No symbols available');
+      }
+
+      // For initial implementation, return first N symbols
+      // In production, you'd implement actual OI-based sorting
+      const topSymbols = allSymbols.slice(0, limit);
+
+      this.logger.info(`Selected ${topSymbols.length} symbols for monitoring`);
+      return topSymbols;
+    } catch (error) {
+      this.logger.error('Failed to get top symbols by OI:', error);
+
+      // Comprehensive fallback list
+      return [
+        'BTCUSDT',
+        'ETHUSDT',
+        'BNBUSDT',
+        'ADAUSDT',
+        'XRPUSDT',
+        'SOLUSDT',
+        'DOTUSDT',
+        'DOGEUSDT',
+        'AVAXUSDT',
+        'MATICUSDT',
+        'LTCUSDT',
+        'LINKUSDT',
+        'ATOMUSDT',
+        'XLMUSDT',
+        'BCHUSDT',
+        'ETCUSDT',
+        'FILUSDT',
+        'THETAUSDT',
+        'VETUSDT',
+        'TRXUSDT',
+        'EOSUSDT',
+        'XMRUSDT',
+        'XTZUSDT',
+        'ALGOUSDT',
+        'ZECUSDT',
+      ].slice(0, limit);
+    }
+  }
+
+  private async makeRequest<T>(endpoint: string, params: Record<string, string> = {}): Promise<T> {
+    const url = new URL(`${this.baseUrl}${endpoint}`);
+    Object.entries(params).forEach(([key, value]) => {
+      url.searchParams.append(key, value);
+    });
+
+    return new Promise((resolve, reject) => {
+      const request = async () => {
+        try {
+          await this.rateLimit();
+
+          this.logger.debug(`Making request to: ${url.toString()}`);
+          const response = await fetch(url.toString());
+
+          if (response.status === 429) {
+            this.logger.warn('Rate limit hit, retrying...');
+            await this.delay(2000);
+            return request();
+          }
+
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+          }
+
+          const data = (await response.json()) as T;
+          resolve(data);
+        } catch (error) {
+          reject(error);
+        }
+      };
+
+      this.requestQueue.push(request);
+      this.processQueue();
+    });
+  }
+
+  private async rateLimit(): Promise<void> {
+    const now = Date.now();
+    const timeSinceLastRequest = now - this.lastRequestTime;
+    const minInterval = 1000 / this.RPS_LIMIT;
+
+    if (timeSinceLastRequest < minInterval) {
+      await this.delay(minInterval - timeSinceLastRequest);
+    }
+
+    this.lastRequestTime = Date.now();
+  }
+
+  private async processQueue(): Promise<void> {
+    if (this.isProcessing || this.requestQueue.length === 0) {
+      return;
+    }
+
+    this.isProcessing = true;
+
+    try {
+      while (this.requestQueue.length > 0) {
+        const request = this.requestQueue.shift();
+        if (request) {
+          await request();
+          await this.delay(1000 / this.RPS_LIMIT);
+        }
+      }
+    } catch (error) {
+      this.logger.error('Error processing request queue:', error);
+    } finally {
+      this.isProcessing = false;
+    }
+  }
+
+  private delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+}
+
+
+========================================================================
+  FILE: src/infrastructure/repositories/signal.repository.ts
+========================================================================
+
+import { Repository } from 'typeorm';
+import { Inject, Injectable } from '../../shared/decorators';
+import { AppDataSource } from '../database/database.module';
+import { Signal } from '../../domain/entities/signal.entity';
+import { ISignalRepository } from '../../domain/interfaces/repositories.interface';
+
+@Injectable()
+export class SignalRepository implements ISignalRepository {
+  private repository: Repository<Signal>;
+
+  constructor() {
+    this.repository = AppDataSource.getRepository(Signal);
+  }
+
+  // Принимаем userId, но пока не используем, т.к. в Signal нет этого поля.
+  // Это позволит остальному коду работать корректно.
+  async getLast24HoursSignalCount(userId: number): Promise<number> {
+    const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    return (
+      this.repository
+        .createQueryBuilder('signal')
+        .where('signal.createdAt >= :date', { date: twentyFourHoursAgo })
+        // TODO: Добавить `andWhere('signal.userId = :userId', { userId })` когда поле будет добавлено
+        .getCount()
+    );
+  }
+
+  async save(signal: Signal): Promise<Signal> {
+    return this.repository.save(signal);
+  }
+
+  async findRecentBySymbol(symbol: string, hours: number): Promise<Signal[]> {
+    const since = new Date(Date.now() - hours * 60 * 60 * 1000);
+    return this.repository
+      .createQueryBuilder('signal')
+      .where('signal.symbol = :symbol', { symbol })
+      .andWhere('signal.createdAt >= :since', { since })
+      .getMany();
+  }
+
+  async getLast24HoursSignalCountBySymbol(userId: number, symbol: string): Promise<number> {
+    const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+    return (
+      this.repository
+        .createQueryBuilder('signal')
+        .where('signal.symbol = :symbol', { symbol })
+        .andWhere('signal.createdAt >= :date', { date: twentyFourHoursAgo })
+        // TODO: Добавить userId когда поле будет в Signal entity
+        .getCount()
+    );
+  }
+
+  // NEW: Get signal statistics for debugging
+  async getSignalStats(userId: number): Promise<{
+    total24h: number;
+    bySymbol: Map<string, number>;
+    topSymbols: Array<{ symbol: string; count: number }>;
+  }> {
+    const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+    // Get all signals in last 24 hours
+    const signals = await this.repository
+      .createQueryBuilder('signal')
+      .where('signal.createdAt >= :date', { date: twentyFourHoursAgo })
+      .getMany();
+
+    // Count by symbol
+    const bySymbol = new Map<string, number>();
+    for (const signal of signals) {
+      const count = bySymbol.get(signal.symbol) || 0;
+      bySymbol.set(signal.symbol, count + 1);
+    }
+
+    // Get top symbols
+    const topSymbols = Array.from(bySymbol.entries())
+      .map(([symbol, count]) => ({ symbol, count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 10);
+
+    return {
+      total24h: signals.length,
+      bySymbol,
+      topSymbols,
+    };
+  }
+}
+
+
+========================================================================
+  FILE: src/infrastructure/repositories/symbol-metadata.repository.ts
+========================================================================
+
+import { Repository } from 'typeorm';
+import { Injectable } from '../../shared/decorators';
+import { AppDataSource } from '../database/database.module';
+import { SymbolMetadata } from '../../domain/entities/symbol-metadata.entity';
+import { ISymbolMetadataRepository } from '../../domain/interfaces/repositories.interface';
+
+@Injectable()
+export class SymbolMetadataRepository implements ISymbolMetadataRepository {
+  private repository: Repository<SymbolMetadata>;
+
+  constructor() {
+    this.repository = AppDataSource.getRepository(SymbolMetadata);
+  }
+
+  async findAllActive(): Promise<SymbolMetadata[]> {
+    return this.repository.find({ where: { isActive: true } });
+  }
+
+  async findBySymbol(symbol: string): Promise<SymbolMetadata | null> {
+    return this.repository.findOne({ where: { symbol } });
+  }
+
+  async save(metadata: SymbolMetadata): Promise<SymbolMetadata> {
+    return this.repository.save(metadata);
+  }
+
+  async updateActiveSymbols(symbols: string[]): Promise<void> {
+    // Фильтруем только USDT пары
+    const usdtSymbols = symbols.filter((symbol) => symbol.endsWith('USDT'));
+
+    await this.repository
+      .createQueryBuilder()
+      .update(SymbolMetadata)
+      .set({ isActive: false })
+      .where('symbol NOT IN (:...symbols)', { symbols: usdtSymbols })
+      .execute();
+
+    for (const symbol of usdtSymbols) {
+      const existing = await this.findBySymbol(symbol);
+      if (!existing) {
+        const metadata = new SymbolMetadata();
+        metadata.symbol = symbol;
+        metadata.isActive = true;
+        await this.save(metadata);
+      } else if (!existing.isActive) {
+        existing.isActive = true;
+        await this.save(existing);
+      }
+    }
+  }
+}
+
+
+========================================================================
+  FILE: src/infrastructure/repositories/trigger.repository.ts
+========================================================================
+
+import { Repository } from 'typeorm';
+import { Injectable } from '../../shared/decorators';
+import { AppDataSource } from '../database/database.module';
+import { Trigger } from '../../domain/entities/trigger.entity';
+import { ITriggerRepository } from '../../domain/interfaces/repositories.interface';
+import { CreateTriggerDto } from '../../application/dto/create-trigger.dto';
+
+@Injectable()
+export class TriggerRepository implements ITriggerRepository {
+  private readonly repository: Repository<Trigger>;
+  private activeTriggersCache: Trigger[] = [];
+
+  constructor() {
+    this.repository = AppDataSource.getRepository(Trigger);
+  }
+
+  public async init(): Promise<void> {
+    await this.loadTriggersIntoCache();
+  }
+
+  public getAllActive(): Trigger[] {
+    return this.activeTriggersCache;
+  }
+
+  public async findByUserId(userId: number): Promise<Trigger[]> {
+    return this.repository.find({ where: { userId, isActive: true } });
+  }
+
+  public async save(dto: CreateTriggerDto): Promise<Trigger> {
+    const newTrigger = this.repository.create(dto);
+    const savedTrigger = await this.repository.save(newTrigger);
+
+    // Немедленно обновляем кэш, чтобы триггер начал работать без перезапуска
+    this.activeTriggersCache.push(savedTrigger);
+
+    return savedTrigger;
+  }
+
+  public async remove(id: number, userId: number): Promise<boolean> {
+    const result = await this.repository.delete({ id, userId });
+
+    if (result.affected && result.affected > 0) {
+      // Удаляем из кэша
+      this.activeTriggersCache = this.activeTriggersCache.filter((t) => t.id !== id);
+      return true;
+    }
+    return false;
+  }
+
+  private async loadTriggersIntoCache(): Promise<void> {
+    this.activeTriggersCache = await this.repository.find({
+      where: { isActive: true },
+    });
+  }
+}
+
+
+========================================================================
+  FILE: src/infrastructure/services/binance-websocket.service.ts
+========================================================================
+
+import WebSocket from 'ws';
+import { Inject, Injectable } from '../../shared/decorators';
+import {
+  IMarketDataGateway,
+  IDataAggregatorService,
+} from '../../domain/interfaces/services.interface';
+import { Logger } from '../../shared/logger';
+
+const SPOT_STREAM_URL = 'wss://stream.binance.com:9443/ws/!miniTicker@arr';
+const FUTURES_STREAM_URL = 'wss://fstream.binance.com/ws/!markPrice@arr@1s';
+const RECONNECT_DELAY = 5000;
+
+@Injectable()
+export class BinanceWebSocketService implements IMarketDataGateway {
+  private readonly logger = new Logger(BinanceWebSocketService.name);
+  private spotWs: WebSocket | null = null;
+  private futuresWs: WebSocket | null = null;
+  private isConnected = false;
+  private isReconnecting = false;
+  private reconnectAttempts = 0;
+  private maxReconnectAttempts = 10;
+
+  constructor(
+    @Inject('IDataAggregatorService')
+    private readonly dataAggregator: IDataAggregatorService,
+  ) {}
+
+  public async connect(): Promise<void> {
+    if (this.isConnected) {
+      return;
+    }
+
+    try {
+      await this.connectToSpotStream();
+      await this.connectToFuturesStream();
+      this.isConnected = true;
+      this.reconnectAttempts = 0;
+      this.logger.info('WebSocket connections established successfully');
+    } catch (error) {
+      this.logger.error('Failed to establish WebSocket connections:', error);
+      throw error;
+    }
+  }
+
+  public async disconnect(): Promise<void> {
+    this.isConnected = false;
+
+    if (this.spotWs) {
+      this.spotWs.close();
+      this.spotWs = null;
+    }
+
+    if (this.futuresWs) {
+      this.futuresWs.close();
+      this.futuresWs = null;
+    }
+
+    this.logger.info('WebSocket connections closed');
+  }
+
+  private async connectToSpotStream(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.spotWs = new WebSocket(SPOT_STREAM_URL);
+
+      this.spotWs.on('open', () => {
+        this.logger.info('Spot WebSocket connection opened');
+        resolve();
+      });
+
+      this.spotWs.on('message', (data: WebSocket.Data) => {
+        try {
+          const messages = JSON.parse(data.toString());
+          this.handleSpotMessages(messages);
+        } catch (error) {
+          this.logger.error('Error parsing spot WebSocket message:', error);
+        }
+      });
+
+      this.spotWs.on('error', (error) => {
+        this.logger.error('Spot WebSocket error:', error);
+        reject(error);
+      });
+
+      this.spotWs.on('close', (code, reason) => {
+        this.logger.warn(`Spot WebSocket closed: ${code} - ${reason}`);
+        this.handleReconnection();
+      });
+    });
+  }
+
+  private async connectToFuturesStream(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.futuresWs = new WebSocket(FUTURES_STREAM_URL);
+
+      this.futuresWs.on('open', () => {
+        this.logger.info('Futures WebSocket connection opened');
+        resolve();
+      });
+
+      this.futuresWs.on('message', (data: WebSocket.Data) => {
+        try {
+          const messages = JSON.parse(data.toString());
+          this.handleFuturesMessages(messages);
+        } catch (error) {
+          this.logger.error('Error parsing futures WebSocket message:', error);
+        }
+      });
+
+      this.futuresWs.on('error', (error) => {
+        this.logger.error('Futures WebSocket error:', error);
+        reject(error);
+      });
+
+      this.futuresWs.on('close', (code, reason) => {
+        this.logger.warn(`Futures WebSocket closed: ${code} - ${reason}`);
+        this.handleReconnection();
+      });
+    });
+  }
+
+  private handleSpotMessages(messages: any[]): void {
+    for (const message of messages) {
+      try {
+        const symbol = message.s;
+        
+        // Filter ONLY USDT pairs
+        if (!symbol.endsWith('USDT')) {
+          continue;
+        }
+
+        const price = parseFloat(message.c);
+        const timestamp = message.E;
+
+        if (symbol && price > 0) {
+          this.dataAggregator.updatePrice(symbol, price, timestamp);
+        }
+      } catch (error) {
+        this.logger.debug('Error processing spot message:', error);
+      }
+    }
+  }
+
+  private handleFuturesMessages(messages: any[]): void {
+    for (const message of messages) {
+      try {
+        const symbol = message.s;
+
+        // Filter ONLY USDT pairs
+        if (!symbol.endsWith('USDT')) {
+          continue;
+        }
+
+        // CRITICAL FIX: Extract BOTH price and OI from futures stream
+        const markPrice = parseFloat(message.p);
+        const openInterest = parseFloat(message.i || message.openInterest);
+        const timestamp = message.E || Date.now();
+
+        if (symbol && openInterest >= 0) {
+          this.dataAggregator.updateOpenInterest(symbol, openInterest, timestamp);
+          
+          // CRITICAL FIX: Also update price from futures stream
+          // This fixes the $0 bug for futures-only pairs that don't exist in spot
+          if (markPrice > 0) {
+            this.dataAggregator.updatePrice(symbol, markPrice, timestamp);
+          }
+        }
+      } catch (error) {
+        this.logger.debug('Error processing futures message:', error);
+      }
+    }
+  }
+
+  private async handleReconnection(): Promise<void> {
+    if (this.isReconnecting || !this.isConnected || this.reconnectAttempts >= this.maxReconnectAttempts) {
+      return;
+    }
+    
+    this.isReconnecting = true;
+    this.reconnectAttempts++;
+    
+    this.logger.info(`Reconnecting... (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+    
+    // Close existing connections
+    await this.disconnect();
+    
+    // Wait before reconnecting
+    await new Promise(resolve => setTimeout(resolve, RECONNECT_DELAY));
+    
+    try {
+      await this.connect();
+      this.isReconnecting = false;
+    } catch (error) {
+      this.logger.error('Reconnection failed:', error);
+      this.isReconnecting = false;
+      // Schedule next attempt
+      this.handleReconnection();
+    }
+  }
+}
+
+
+========================================================================
+  FILE: src/infrastructure/services/data-aggregator.service.ts
+========================================================================
+
+import { Injectable } from '../../shared/decorators';
+import { IDataAggregatorService, IMetricChanges } from '../../domain/interfaces/services.interface';
+import { Logger } from '../../shared/logger';
+
+type RawPoint = {
+  timestamp: number;
+  price: number;
+  openInterest: number;
+};
+
+@Injectable()
+export class DataAggregatorService implements IDataAggregatorService {
+  private readonly logger = new Logger(DataAggregatorService.name);
+
+  // Config
+  private readonly MAX_RAW_POINTS = 10_000;        // ~2–3 часа при 1 тик/сек
+  private readonly CACHE_TTL_MS = 2_000;           // 2 секунды — идеально для реалтайма
+  private readonly CLEANUP_INTERVAL_MS = 30_000;
+  private readonly MAX_DATA_AGE_MINUTES = 180;     // 3 часа — чистим старое
+
+  // Storage
+  private readonly rawPoints = new Map<string, RawPoint[]>();           // Главное хранилище
+  private readonly lastKnownPrices = new Map<string, number>();
+  private readonly lastKnownOI = new Map<string, number>();
+  private readonly lastSeen = new Map<string, number>();
+
+  // Cache: symbol_interval → result
+  private readonly calcCache = new Map<string, { timestamp: number; result: IMetricChanges }>();
+
+  // Queue per symbol (serializes updates)
+  private readonly updateQueues = new Map<string, Array<() => Promise<void>>>();
+  private readonly processingSymbols = new Set<string>();
+
+  // Timers
+  private cleanupTimer: NodeJS.Timeout | null = null;
+
+  constructor() {
+    this.cleanupTimer = setInterval(() => this.performCleanup(), this.CLEANUP_INTERVAL_MS);
+  }
+
+  // ===================================================================
+  // Public API — полностью обратно совместимый
+  // ===================================================================
+
+  public updatePrice(symbol: string, price: number, timestamp: number): void {
+    this.enqueue(symbol, async () => {
+      this.lastSeen.set(symbol, Date.now());
+      if (price > 0) this.lastKnownPrices.set(symbol, price);
+
+      const oi = this.lastKnownOI.get(symbol) ?? 0;
+      this.insertRawPoint(symbol, { timestamp, price, openInterest: oi });
+      this.invalidateCache(symbol);
+    });
+  }
+
+  public updateOpenInterest(symbol: string, openInterest: number, timestamp: number): void {
+    this.enqueue(symbol, async () => {
+      this.lastSeen.set(symbol, Date.now());
+      if (openInterest >= 0) this.lastKnownOI.set(symbol, openInterest);
+
+      const price = this.lastKnownPrices.get(symbol) ?? 0;
+      this.insertRawPoint(symbol, { timestamp, price, openInterest });
+      this.invalidateCache(symbol);
+    });
+  }
+
+  public getMetricChanges(symbol: string, timeIntervalMinutes: number): IMetricChanges | null {
+    if (!symbol || timeIntervalMinutes < 1 || timeIntervalMinutes > 30) {
+      return null;
+    }
+
+    const key = `${symbol}_${timeIntervalMinutes}`;
+    const cached = this.calcCache.get(key);
+    if (cached && Date.now() - cached.timestamp < this.CACHE_TTL_MS) {
+      return cached.result;
+    }
+
+    const result = this.getExactExchangeStyleChange(symbol, timeIntervalMinutes);
+
+    if (result) {
+      this.calcCache.set(key, { timestamp: Date.now(), result });
+    }
+
+    return result;
+  }
+
+  public getCurrentPrice(symbol: string): number {
+    const arr = this.rawPoints.get(symbol);
+    if (arr && arr.length > 0) {
+      return arr[arr.length - 1].price;
+    }
+    return this.lastKnownPrices.get(symbol) ?? 0;
+  }
+
+  public getAllKnownSymbols(): string[] {
+    const set = new Set<string>([
+      ...this.rawPoints.keys(),
+      ...this.lastKnownPrices.keys(),
+      ...this.lastKnownOI.keys(),
+    ]);
+    return Array.from(set);
+  }
+
+  public getHistoryLength(symbol: string): number {
+    return this.rawPoints.get(symbol)?.length ?? 0;
+  }
+
+  public shutdown(): void {
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = null;
+    }
+  }
+
+  // ===================================================================
+  // Биржевой расчёт — 100% совпадение с Binance/Bybit/OKX/Hyperliquid
+  // ===================================================================
+
+  private getExactExchangeStyleChange(symbol: string, minutes: number): IMetricChanges | null {
+    const arr = this.rawPoints.get(symbol);
+    if (!arr || arr.length < 2) return null;
+
+    const now = Date.now();
+    const targetPast = now - minutes * 60 * 1000;
+
+    // Current values
+    const current = arr[arr.length - 1];
+    const currentPrice = current.price;
+    const currentOI = current.openInterest;
+
+    if (currentPrice <= 0) return null;
+
+    // Найти индекс ПЕРВОЙ точки с timestamp >= targetPast
+    let left = 0;
+    let right = arr.length - 1;
+    let candidateIdx = -1;
+
+    while (left <= right) {
+      const mid = (left + right) >> 1;
+      if (arr[mid].timestamp >= targetPast) {
+        candidateIdx = mid;
+        right = mid - 1; // ищем ещё левее
+      } else {
+        left = mid + 1;
+      }
+    }
+
+    // Нет достаточно старых данных
+    if (candidateIdx === -1) return null;
+
+    const past = arr[candidateIdx];
+    if (past.price <= 0) return null;
+
+    const priceChangePercent = ((currentPrice - past.price) / past.price) * 100;
+
+    const oiChangePercent =
+      past.openInterest > 0 && currentOI >= 0
+        ? ((currentOI - past.openInterest) / past.openInterest) * 100
+        : 0;
+
+    return {
+      priceChangePercent: Number(priceChangePercent.toFixed(6)),
+      oiChangePercent: Number(oiChangePercent.toFixed(4)),
+      currentPrice,
+      currentOI,
+    };
+  }
+
+  // ===================================================================
+  // Внутренняя очередь (защита от race condition)
+  // ===================================================================
+
+  private async enqueue(symbol: string, fn: () => Promise<void>): Promise<void> {
+    if (!this.updateQueues.has(symbol)) {
+      this.updateQueues.set(symbol, []);
+    }
+    const queue = this.updateQueues.get(symbol)!;
+    queue.push(fn);
+
+    if (!this.processingSymbols.has(symbol)) {
+      this.processingSymbols.add(symbol);
+      await this.processQueue(symbol);
+      this.processingSymbols.delete(symbol);
+    }
+  }
+
+  private async processQueue(symbol: string): Promise<void> {
+    const queue = this.updateQueues.get(symbol)!;
+    while (queue.length > 0) {
+      const task = queue.shift()!;
+      try {
+        await task();
+      } catch (err) {
+        this.logger.error(`Error processing update for ${symbol}:`, err);
+      }
+    }
+  }
+
+  // ===================================================================
+  // Raw points management
+  // ===================================================================
+
+  private insertRawPoint(symbol: string, point: RawPoint): void {
+    let arr = this.rawPoints.get(symbol);
+    if (!arr) {
+      arr = [];
+      this.rawPoints.set(symbol, arr);
+    }
+
+    // Быстрая вставка в конец (99.9% случаев)
+    if (arr.length === 0 || point.timestamp >= arr[arr.length - 1].timestamp) {
+      arr.push(point);
+    } else {
+      // Редкий случай — out-of-order
+      const idx = arr.findIndex(p => p.timestamp >= point.timestamp);
+      if (idx === -1) {
+        arr.push(point);
+      } else if (arr[idx].timestamp === point.timestamp) {
+        arr[idx] = point;
+      } else {
+        arr.splice(idx, 0, point);
+      }
+    }
+
+    // Обрезка старого
+    if (arr.length > this.MAX_RAW_POINTS) {
+      arr.splice(0, arr.length - this.MAX_RAW_POINTS);
+    }
+  }
+
+  // ===================================================================
+  // Cache & Cleanup
+  // ===================================================================
+
+  private invalidateCache(symbol: string): void {
+    for (const key of this.calcCache.keys()) {
+      if (key.startsWith(symbol + '_')) {
+        this.calcCache.delete(key);
+      }
+    }
+  }
+
+  private performCleanup(): void {
+    const now = Date.now();
+    const maxAgeMs = this.MAX_DATA_AGE_MINUTES * 60 * 1000;
+
+    // Cache cleanup
+    for (const [key, entry] of this.calcCache.entries()) {
+      if (now - entry.timestamp > this.CACHE_TTL_MS) {
+        this.calcCache.delete(key);
+      }
+    }
+
+    // Raw points cleanup
+    for (const [symbol, arr] of this.rawPoints.entries()) {
+      const cutoff = now - maxAgeMs;
+      let i = 0;
+      while (i < arr.length && arr[i].timestamp < cutoff) i++;
+      if (i > 0) arr.splice(0, i);
+      if (arr.length === 0) this.rawPoints.delete(symbol);
+    }
+
+    // Удаляем полностью мёртвые символы
+    const staleThreshold = now - maxAgeMs * 2;
+    for (const [symbol, last] of this.lastSeen.entries()) {
+      if (last < staleThreshold) {
+        this.rawPoints.delete(symbol);
+        this.lastKnownPrices.delete(symbol);
+        this.lastKnownOI.delete(symbol);
+        this.lastSeen.delete(symbol);
+        this.invalidateCache(symbol);
+      }
+    }
+  }
+}
+
+
+========================================================================
+  FILE: src/infrastructure/services/notification.service.ts
+========================================================================
+
+import { Inject, Injectable } from '../../shared/decorators';
+import { INotificationService, IMetricChanges } from '../../domain/interfaces/services.interface';
+import { ISignalRepository } from '../../domain/interfaces/repositories.interface';
+import { Trigger } from '../../domain/entities/trigger.entity';
+import { SignalDto, SignalQuality } from '../../application/dto/signal.dto';
+import { SignalHandler } from '../../presentation/telegram/handlers/signal.handler';
+import { Logger } from '../../shared/logger';
+
+@Injectable()
+export class NotificationService implements INotificationService {
+  private readonly logger = new Logger(NotificationService.name);
+  private readonly notificationCooldowns = new Map<string, number>();
+
+  constructor(
+    private readonly signalHandler: SignalHandler,
+    @Inject('ISignalRepository')
+    private readonly signalRepository: ISignalRepository,
+  ) {}
+
+  public async processTrigger(
+    trigger: Trigger,
+    symbol: string,
+    metrics: IMetricChanges,
+  ): Promise<void> {
+    const cooldownKey = `${trigger.userId}-${symbol}`;
+    const lastNotification = this.notificationCooldowns.get(cooldownKey);
+    const now = Date.now();
+
+    if (lastNotification && now - lastNotification < trigger.notificationLimitSeconds * 1000) {
+      return;
+    }
+
+    this.logger.info(
+      `Trigger #${trigger.id} fired for user ${trigger.userId} on symbol ${symbol}. OI change: ${metrics.oiChangePercent.toFixed(2)}%`,
+    );
+
+    this.notificationCooldowns.set(cooldownKey, now);
+
+    const deltaPercent = metrics.oiChangePercent - metrics.priceChangePercent;
+
+    // Quality scoring
+    const absoluteStrength = Math.min(Math.abs(metrics.oiChangePercent) / 10, 1.0);
+    const alignment =
+      1 - Math.min(Math.abs(deltaPercent) / (Math.abs(metrics.oiChangePercent) + 0.1), 1);
+    const deltaStrength =
+      deltaPercent > 0 ? Math.min(deltaPercent / 5, 1.0) : Math.max(1 + deltaPercent / 10, 0.3);
+
+    const qualityScore = Math.min(
+      1,
+      0.6 * absoluteStrength + 0.3 * alignment + 0.1 * deltaStrength,
+    );
+
+    let quality: SignalQuality;
+    if (qualityScore > 0.7) quality = 'strong';
+    else if (qualityScore > 0.4) quality = 'medium';
+    else quality = 'weak';
+
+    // FIXED: Don't query for signal count here - SignalHandler will do it
+    // This was causing double database queries!
+
+    // Use price from metrics (same calculation that triggered the alert)
+    const currentPrice = metrics.currentPrice > 0 ? metrics.currentPrice : 0;
+
+    if (currentPrice === 0) {
+      this.logger.error(
+        `🚨 ZERO PRICE BUG DETECTED! Symbol: ${symbol}, ` +
+          `OI Change: ${metrics.oiChangePercent.toFixed(2)}%, ` +
+          `Price Change: ${metrics.priceChangePercent.toFixed(2)}%, ` +
+          `CurrentOI: ${metrics.currentOI}, ` +
+          `Trigger: #${trigger.id}`,
+      );
+      return;
+    }
+
+    // FIXED: Pass 0 as signal number - SignalHandler will set the correct one
+    const signalDto = new SignalDto(
+      0, // Placeholder - SignalHandler will query and set correct number
+      symbol,
+      metrics.priceChangePercent,
+      metrics.oiChangePercent,
+      deltaPercent,
+      currentPrice,
+      new Date(),
+      quality,
+      trigger.timeIntervalMinutes,
+    );
+
+    await this.signalHandler.handleSignal(signalDto, [trigger.userId], trigger.timeIntervalMinutes);
+  }
+}
+
+
+========================================================================
+  FILE: src/infrastructure/services/trigger-engine.service.ts
+========================================================================
+
+// src/infrastructure/services/trigger-engine.service.ts
+
+import { Inject, Injectable } from '../../shared/decorators';
+import {
+  IDataAggregatorService,
+  ITriggerEngineService,
+  INotificationService,
+} from '../../domain/interfaces/services.interface';
+import { ITriggerRepository } from '../../domain/interfaces/repositories.interface';
+import { Trigger } from '../../domain/entities/trigger.entity';
+import { Logger } from '../../shared/logger';
+
+const TICK_INTERVAL_MS = 15 * 1000;
+const BATCH_PROCESSING_SIZE = 10;
+
+@Injectable()
+export class TriggerEngineService implements ITriggerEngineService {
+  private readonly logger = new Logger(TriggerEngineService.name);
+  private interval: NodeJS.Timeout | null = null;
+  private isRunning = false;
+  private processedSymbols = new Set<string>();
+  private symbolRotationIndex = 0;
+
+  constructor(
+    @Inject('ITriggerRepository') private readonly triggerRepository: ITriggerRepository,
+    @Inject('IDataAggregatorService') private readonly dataAggregator: IDataAggregatorService,
+    @Inject('INotificationService') private readonly notificationService: INotificationService,
+  ) {}
+
+  public start(): void {
+    if (this.isRunning) {
+      this.logger.warn('Trigger engine is already running');
+      return;
+    }
+
+    this.isRunning = true;
+    this.interval = setInterval(() => {
+      this.processTick().catch(error => {
+        this.logger.error('Error in trigger engine tick:', error);
+      });
+    }, TICK_INTERVAL_MS);
+
+    this.logger.info('Trigger engine started');
+  }
+
+  public stop(): void {
+    this.isRunning = false;
+    
+    if (this.interval) {
+      clearInterval(this.interval);
+      this.interval = null;
+    }
+
+    this.processedSymbols.clear();
+    this.symbolRotationIndex = 0;
+    
+    this.logger.info('Trigger engine stopped');
+  }
+
+  private async processTick(): Promise<void> {
+    try {
+      const activeTriggers = this.triggerRepository.getAllActive();
+      if (activeTriggers.length === 0) {
+        return;
+      }
+
+      const allSymbols = this.dataAggregator.getAllKnownSymbols();
+      if (allSymbols.length === 0) {
+        return;
+      }
+
+      const symbolsToProcess = this.getSymbolsBatch(allSymbols);
+      
+      this.logger.debug(`Processing ${symbolsToProcess.length} symbols, ${activeTriggers.length} active triggers`);
+
+      for (const symbol of symbolsToProcess) {
+        await this.processSymbol(symbol, activeTriggers);
+      }
+
+    } catch (error) {
+      this.logger.error('Error processing trigger engine tick:', error);
+    }
+  }
+
+  private getSymbolsBatch(allSymbols: string[]): string[] {
+    const startIndex = this.symbolRotationIndex;
+    const endIndex = Math.min(startIndex + BATCH_PROCESSING_SIZE, allSymbols.length);
+    
+    const batch = allSymbols.slice(startIndex, endIndex);
+    
+    this.symbolRotationIndex = endIndex >= allSymbols.length ? 0 : endIndex;
+    
+    return batch;
+  }
+
+  private async processSymbol(symbol: string, activeTriggers: Trigger[]): Promise<void> {
+    try {
+      const historyLength = this.dataAggregator.getHistoryLength(symbol);
+      if (historyLength < 2) {
+        return;
+      }
+
+      const relevantTriggers = this.getRelevantTriggersForSymbol(symbol, activeTriggers);
+      
+      if (relevantTriggers.length === 0) {
+        return;
+      }
+
+      for (const trigger of relevantTriggers) {
+        await this.processTriggerForSymbol(trigger, symbol);
+      }
+
+    } catch (error) {
+      this.logger.error(`Error processing symbol ${symbol}:`, error);
+    }
+  }
+
+  private getRelevantTriggersForSymbol(symbol: string, triggers: Trigger[]): Trigger[] {
+    return triggers;
+  }
+
+  private async processTriggerForSymbol(trigger: Trigger, symbol: string): Promise<void> {
+    try {
+      const metrics = this.dataAggregator.getMetricChanges(symbol, trigger.timeIntervalMinutes);
+      
+      if (!metrics) {
+        return;
+      }
+
+      if (this.shouldTriggerFire(trigger, metrics)) {
+        await this.notificationService.processTrigger(trigger, symbol, metrics);
+      }
+
+    } catch (error) {
+      this.logger.error(`Error processing trigger ${trigger.id} for ${symbol}:`, error);
+    }
+  }
+
+  private shouldTriggerFire(trigger: Trigger, metrics: { priceChangePercent: number; oiChangePercent: number }): boolean {
+    const { direction, oiChangePercent: triggerThreshold } = trigger;
+    const { oiChangePercent: actualOIChange } = metrics;
+
+    if (direction === 'up') {
+      return actualOIChange >= triggerThreshold;
+    } else if (direction === 'down') {
+      return actualOIChange <= -triggerThreshold;
+    }
+
+    return false;
+  }
+
+  public async forceCheckSymbol(symbol: string): Promise<void> {
+    const activeTriggers = this.triggerRepository.getAllActive();
+    await this.processSymbol(symbol, activeTriggers);
+  }
+
+  public getEngineStats(): { isRunning: boolean; processedSymbolsCount: number } {
+    return {
+      isRunning: this.isRunning,
+      processedSymbolsCount: this.processedSymbols.size
+    };
+  }
+}
+
+
+========================================================================
+  FILE: src/infrastructure/telegram/telegram.bot.ts
+========================================================================
+
+import TelegramBot from 'node-telegram-bot-api';
+import { Injectable } from '../../shared/decorators';
+import { Logger } from '../../shared/logger';
+import { SignalDto, SignalQuality } from '../../application/dto/signal.dto';
+
+@Injectable()
+export class TelegramBotService {
+  private bot: TelegramBot;
+  private readonly logger = new Logger(TelegramBotService.name);
+
+  constructor(token: string) {
+    if (!token) {
+      throw new Error('Telegram Bot Token is not provided!');
+    }
+    this.bot = new TelegramBot(token, { polling: true });
+    this.setupErrorHandling();
+  }
+
+  public getBot(): TelegramBot {
+    return this.bot;
+  }
+
+  public async sendMessage(chatId: number, message: string): Promise<void> {
+    try {
+      await this.bot.sendMessage(chatId, message, {
+        parse_mode: 'HTML',
+        disable_web_page_preview: true, // ← ДОБАВЛЯЕМ ЭТУ СТРОКУ
+      });
+    } catch (error) {
+      this.logger.error(`Failed to send Telegram message to chat ${chatId}:`, error);
+    }
+  }
+
+  /**
+   * Принимает на вход полный SignalDto и отправляет отформатированное сообщение.
+   */
+  public async sendSignal(
+    chatId: number,
+    signal: SignalDto,
+    triggerIntervalMinutes?: number,
+  ): Promise<void> {
+    const message = this.formatSignalMessage(signal, triggerIntervalMinutes);
+    await this.sendMessage(chatId, message);
+  }
+
+  private formatSignalMessage(signal: SignalDto, triggerIntervalMinutes?: number): string {
+    // Quality emoji mapping
+    const qualityEmoji = {
+      strong: '🟢',
+      medium: '🟡',
+      weak: '🔴',
+    };
+
+    // Format percentage with sign
+    const formatPercent = (value: number): string => {
+      const sign = value >= 0 ? '↗️' : '↘️';
+      const absValue = Math.abs(value).toFixed(2);
+      return `${sign} ${absValue}%`;
+    };
+
+    // Format delta
+    const formatDelta = (value: number): string => {
+      const absValue = Math.abs(value);
+      if (absValue < 0.01) {
+        return '0.00%';
+      }
+      return `${absValue.toFixed(2)}%`;
+    };
+
+    // Short time format (HH:MM)
+    const timeStr = signal.timestamp.toLocaleTimeString('ru-RU', {
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+
+    // Format price with appropriate decimal places
+    const priceStr = this.formatPrice(signal.currentPrice);
+
+    // Format time interval display
+    const intervalDisplay = triggerIntervalMinutes ? `${triggerIntervalMinutes}m` : '';
+
+    // Build Binance futures link
+    const binanceLink = `https://www.binance.com/ru/futures/${signal.symbol}`;
+
+    // Build TradingView chart link
+    const tradingViewLink = `https://www.tradingview.com/chart/?symbol=BINANCE:${signal.symbol}`;
+
+    // Build the message with clickable links
+    return `
+🔴 №${signal.signalNumber} - <a href="${binanceLink}">${signal.symbol}</a> - ${intervalDisplay}
+<a href="${tradingViewLink}">OI: ${formatPercent(signal.oiGrowthPercent)}</a> | Price: ${formatPercent(signal.priceChangePercent)} | Δ: ${formatDelta(signal.deltaPercent)}
+💵 $${priceStr} • ⏰ ${timeStr}
+  `.trim();
+  }
+
+  /**
+   * Smart price formatting based on value magnitude
+   */
+  private formatPrice(price: number): string {
+    if (price >= 1000) {
+      return price.toFixed(2); // $1,234.56
+    } else if (price >= 1) {
+      return price.toFixed(4); // $12.3456
+    } else if (price >= 0.01) {
+      return price.toFixed(4); // $0.1234
+    } else {
+      return price.toFixed(6); // $0.000123
+    }
+  }
+
+  private setupErrorHandling(): void {
+    this.bot.on('error', (error) => {
+      this.logger.error('Telegram Bot error:', error);
+    });
+
+    this.bot.on('polling_error', (error) => {
+      this.logger.error('Telegram Bot polling error:', error);
+    });
+  }
+
+  public async stop(): Promise<void> {
+    if (this.bot.isPolling()) {
+      await this.bot.stopPolling();
+    }
+  }
+}
+
+
+========================================================================
+  FILE: src/presentation/telegram/handlers/command.handler.ts
+========================================================================
+
+import TelegramBot from 'node-telegram-bot-api';
+import { Inject, Injectable } from '../../../shared/decorators';
+import { TelegramBotService } from '../../../infrastructure/telegram/telegram.bot';
+import { CreateTriggerUseCase } from '../../../application/use-cases/create-trigger.use-case';
+import { GetTriggersUseCase } from '../../../application/use-cases/get-triggers.use-case';
+import { RemoveTriggerUseCase } from '../../../application/use-cases/remove-trigger.use-case';
+import { CreateTriggerDto } from '../../../application/dto/create-trigger.dto';
+import { validate } from 'class-validator';
+import { Logger } from '../../../shared/logger';
+import { Direction } from '../../../domain/types/direction.type';
+import { Trigger } from '../../../domain/entities/trigger.entity';
+
+@Injectable()
+export class CommandHandler {
+  private readonly logger = new Logger(CommandHandler.name);
+  private bot: TelegramBot;
+
+  constructor(
+    private readonly telegramBotService: TelegramBotService,
+    private readonly createTriggerUseCase: CreateTriggerUseCase,
+    private readonly getTriggersUseCase: GetTriggersUseCase,
+    private readonly removeTriggerUseCase: RemoveTriggerUseCase,
+  ) {
+    this.bot = this.telegramBotService.getBot();
+  }
+
+  public initialize(): void {
+    this.bot.onText(/\/start/, this.handleStart.bind(this));
+    this.bot.onText(/\/add/, this.handleAddTrigger.bind(this));
+    this.bot.onText(/\/my_triggers/, this.handleMyTriggers.bind(this));
+    this.bot.on('callback_query', this.handleCallbackQuery.bind(this));
+    this.logger.info('Telegram command handlers initialized.');
+  }
+
+  private async handleStart(msg: TelegramBot.Message): Promise<void> {
+    const chatId = msg.chat.id;
+    const welcomeMessage = `
+👋 <b>Добро пожаловать в Pump Scout Bot!</b>
+
+Я слежу за аномальными изменениями <b>Открытого Интереса (ОИ)</b> по всем USDT парам.
+
+<b>Как создать триггер:</b>
+Отправьте команду в формате:
+<code>/add [up/down] [ОИ %] [интервал мин] [кулдаун сек]</code>
+
+<b>Пример:</b>
+<code>/add up 10 15 60</code>
+(Уведомить, если <b>ОИ</b> вырастет на <b>10%</b> за <b>15 минут</b>. Кулдаун уведомлений <b>60 секунд</b>)
+
+В уведомлении также будет указано изменение цены за этот же период.
+
+<b>Доступные команды:</b>
+/add - Создать новый триггер
+/my_triggers - Ваши активные триггеры
+    `.trim();
+    await this.telegramBotService.sendMessage(chatId, welcomeMessage);
+  }
+
+  private async handleAddTrigger(msg: TelegramBot.Message): Promise<void> {
+    const chatId = msg.chat.id;
+    const userId = msg.from?.id;
+
+    if (!userId || !msg.text) return;
+
+    const parts = msg.text.trim().split(/\s+/);
+    if (parts.length !== 5) {
+      // <-- Теперь ожидаем 5 частей
+      await this.telegramBotService.sendMessage(
+        chatId,
+        '❌ Неверный формат. Пример: <code>/add up 10 15 60</code>',
+      );
+      return;
+    }
+
+    const [, direction, oiPercent, interval, limit] = parts;
+    const dto = new CreateTriggerDto();
+    dto.userId = userId;
+    dto.direction = direction as Direction;
+    dto.oiChangePercent = parseFloat(oiPercent);
+    dto.timeIntervalMinutes = parseInt(interval, 10);
+    dto.notificationLimitSeconds = parseInt(limit, 10);
+
+    const errors = await validate(dto);
+    if (errors.length > 0) {
+      const errorMessage = errors
+        .map((e) => Object.values(e.constraints || {}).join(', '))
+        .join('; ');
+      await this.telegramBotService.sendMessage(chatId, `❌ Ошибка валидации: ${errorMessage}`);
+      return;
+    }
+
+    try {
+      await this.createTriggerUseCase.execute(dto);
+      await this.telegramBotService.sendMessage(
+        chatId,
+        '✅ Триггер на изменение ОИ успешно создан!',
+      );
+    } catch (error) {
+      this.logger.error('Failed to create trigger:', error);
+      await this.telegramBotService.sendMessage(
+        chatId,
+        '❗️ Произошла ошибка при создании триггера.',
+      );
+    }
+  }
+
+  private async handleMyTriggers(msg: TelegramBot.Message): Promise<void> {
+    const chatId = msg.chat.id;
+    const userId = msg.from?.id;
+    if (!userId) return;
+
+    const triggers = await this.getTriggersUseCase.execute(userId);
+
+    if (triggers.length === 0) {
+      await this.telegramBotService.sendMessage(chatId, 'У вас пока нет активных триггеров.');
+      return;
+    }
+
+    const message =
+      '<b>Ваши активные триггеры:</b>\n\n' + triggers.map(this.formatTrigger).join('\n');
+    const options: TelegramBot.SendMessageOptions = {
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: triggers.map((trigger) => [
+          {
+            text: `❌ Удалить триггер #${trigger.id}`,
+            callback_data: `delete_trigger_${trigger.id}`,
+          },
+        ]),
+      },
+    };
+
+    await this.bot.sendMessage(chatId, message, options);
+  }
+
+  private formatTrigger(trigger: Trigger): string {
+    const directionEmoji = trigger.direction === 'up' ? '📈' : '📉';
+    return `${directionEmoji} #${trigger.id}: ОИ на <b>${trigger.oiChangePercent}%</b> за <b>${trigger.timeIntervalMinutes} мин.</b> (кулдаун ${trigger.notificationLimitSeconds} сек)`;
+  }
+
+  private async handleCallbackQuery(query: TelegramBot.CallbackQuery): Promise<void> {
+    if (!query.data || !query.message) return;
+
+    const chatId = query.message.chat.id;
+    const userId = query.from.id;
+    const [action, entity, id] = query.data.split('_');
+
+    if (action === 'delete' && entity === 'trigger') {
+      try {
+        const triggerId = parseInt(id, 10);
+        const success = await this.removeTriggerUseCase.execute(triggerId, userId);
+
+        if (success) {
+          await this.bot.answerCallbackQuery(query.id, { text: 'Триггер удален!' });
+          // Редактируем сообщение, чтобы убрать кнопку
+          await this.bot.editMessageText('Триггер был успешно удален.', {
+            chat_id: chatId,
+            message_id: query.message.message_id,
+          });
+        } else {
+          await this.bot.answerCallbackQuery(query.id, { text: 'Не удалось найти триггер.' });
+        }
+      } catch (error) {
+        this.logger.error('Failed to delete trigger:', error);
+        await this.bot.answerCallbackQuery(query.id, { text: 'Ошибка при удалении.' });
+      }
+    }
+  }
+}
+
+
+========================================================================
+  FILE: src/presentation/telegram/handlers/signal.handler.ts
+========================================================================
+
+import { Inject, Injectable } from '../../../shared/decorators';
+import { TelegramBotService } from '../../../infrastructure/telegram/telegram.bot';
+import { SignalDto } from '../../../application/dto/signal.dto';
+import { ISignalRepository } from '../../../domain/interfaces/repositories.interface';
+import { Signal } from '../../../domain/entities/signal.entity';
+import { Logger } from '../../../shared/logger';
+
+@Injectable()
+export class SignalHandler {
+  private readonly logger = new Logger(SignalHandler.name);
+
+  constructor(
+    private readonly telegramBotService: TelegramBotService,
+    @Inject('ISignalRepository')
+    private readonly signalRepository: ISignalRepository,
+  ) {}
+
+  async handleSignal(signalDto: SignalDto, userIds: number[], triggerIntervalMinutes?: number): Promise<void> {
+    try {
+      // ✅ CORRECT: Query per-symbol count for each user
+      for (const userId of userIds) {
+        // Get the signal count for THIS SPECIFIC SYMBOL in last 24 hours
+        const signalCount = await this.signalRepository.getLast24HoursSignalCountBySymbol(
+          userId,
+          signalDto.symbol,
+        );
+
+        // Create signal entity with correct per-symbol number
+        const signal = new Signal();
+        signal.signalNumber = signalCount + 1;
+        signal.symbol = signalDto.symbol;
+        signal.priceChangePercent = signalDto.priceChangePercent;
+        signal.oiGrowthPercent = signalDto.oiGrowthPercent;
+        signal.deltaPercent = signalDto.deltaPercent;
+        signal.currentPrice = signalDto.currentPrice;
+
+        // Save to database
+        await this.signalRepository.save(signal);
+
+        // Send to Telegram with correct number
+        await this.telegramBotService.sendSignal(
+          userId, 
+          {
+            ...signalDto,
+            signalNumber: signalCount + 1,
+            timestamp: new Date(),
+          },
+          triggerIntervalMinutes  // ← ADD THIS LINE
+        );
+      }
+
+      this.logger.info(`Signal sent for ${signalDto.symbol}`);
+    } catch (error) {
+      this.logger.error('Error handling signal:', error);
+    }
+  }
+}
+
+
+========================================================================
+  FILE: src/shared/container.ts
+========================================================================
+
+import { isInjectable, getInjectedParams } from './decorators';
+
+type Token = string | Function;
+type FactoryFunction<T> = () => T;
+
+interface Binding {
+  token: Token;
+  factory: FactoryFunction<any>;
+  singleton: boolean;
+  instance?: any;
+}
+
+export class DIContainer {
+  private bindings: Map<Token, Binding> = new Map();
+  private static instance: DIContainer;
+
+  static getInstance(): DIContainer {
+    if (!DIContainer.instance) {
+      DIContainer.instance = new DIContainer();
+    }
+    return DIContainer.instance;
+  }
+
+  bind<T>(token: Token, factory: FactoryFunction<T>, singleton: boolean = true): void {
+    this.bindings.set(token, { token, factory, singleton });
+  }
+
+  bindClass<T>(
+    token: Token,
+    constructor: new (...args: any[]) => T,
+    singleton: boolean = true,
+  ): void {
+    this.bind(
+      token,
+      () => {
+        const paramTypes = getInjectedParams(constructor) || [];
+        const args = paramTypes.map(({ token: paramToken }) => {
+          try {
+            return this.get(paramToken);
+          } catch (error) {
+            // If dependency is not found and it's an injectable class, try to auto-register it
+            if (typeof paramToken === 'function' && isInjectable(paramToken)) {
+              this.bindClass(paramToken, paramToken as new (...args: any[]) => any);
+              return this.get(paramToken);
+            }
+            throw error;
+          }
+        });
+        return new constructor(...args);
+      },
+      singleton,
+    );
+  }
+
+  get<T>(token: Token): T {
+    const binding = this.bindings.get(token);
+
+    if (!binding) {
+      // Auto-register injectable classes
+      if (typeof token === 'function' && isInjectable(token)) {
+        this.bindClass(token, token as new (...args: any[]) => T);
+        return this.get(token);
+      }
+      throw new Error(`No binding found for token: ${token}`);
+    }
+
+    if (binding.singleton && binding.instance) {
+      return binding.instance;
+    }
+
+    const instance = binding.factory();
+
+    if (binding.singleton) {
+      binding.instance = instance;
+    }
+
+    return instance;
+  }
+
+  unbind(token: Token): void {
+    this.bindings.delete(token);
+  }
+
+  clear(): void {
+    this.bindings.clear();
+  }
+}
+
+export const container = DIContainer.getInstance();
+
+
+========================================================================
+  FILE: src/shared/decorators.ts
+========================================================================
+
+import 'reflect-metadata';
+
+const INJECTABLE_METADATA_KEY = 'injectable';
+const INJECT_METADATA_KEY = 'inject';
+
+export function Injectable(): ClassDecorator {
+  return (target: any) => {
+    Reflect.defineMetadata(INJECTABLE_METADATA_KEY, true, target);
+  };
+}
+
+export function Inject(token: string): ParameterDecorator {
+  return (target: any, propertyKey: string | symbol | undefined, parameterIndex: number) => {
+    const existingInjections = Reflect.getMetadata(INJECT_METADATA_KEY, target) || [];
+    existingInjections.push({ index: parameterIndex, token });
+    Reflect.defineMetadata(INJECT_METADATA_KEY, existingInjections, target);
+  };
+}
+
+export function isInjectable(target: any): boolean {
+  return Reflect.getMetadata(INJECTABLE_METADATA_KEY, target) === true;
+}
+
+export function getInjectedParams(target: any): Array<{ index: number; token: string }> {
+  return Reflect.getMetadata(INJECT_METADATA_KEY, target) || [];
+}
+
+
+========================================================================
+  FILE: src/shared/logger.ts
+========================================================================
+
+import winston from 'winston';
+
+export class Logger {
+  private logger: winston.Logger;
+
+  constructor(private context: string) {
+    this.logger = winston.createLogger({
+      level: process.env.LOG_LEVEL || 'info',
+      format: winston.format.combine(
+        winston.format.timestamp(),
+        winston.format.errors({ stack: true }),
+        winston.format.json(),
+      ),
+      defaultMeta: { context },
+      transports: [
+        new winston.transports.Console({
+          format: winston.format.combine(winston.format.colorize(), winston.format.simple()),
+        }),
+        new winston.transports.File({ filename: 'error.log', level: 'error' }),
+        new winston.transports.File({ filename: 'combined.log' }),
+      ],
+    });
+  }
+
+  info(message: string, meta?: any): void {
+    this.logger.info(message, meta);
+  }
+
+  error(message: string, meta?: any): void {
+    this.logger.error(message, meta);
+  }
+
+  warn(message: string, meta?: any): void {
+    this.logger.warn(message, meta);
+  }
+
+  debug(message: string, meta?: any): void {
+    this.logger.debug(message, meta);
+  }
+}
+
+
+========================================================================
+  FILE: src/shared/types/mutable.type.ts
+========================================================================
+
+/**
+ * Утилитарный тип, который снимает модификатор `readonly` со всех свойств типа T.
+ */
+export type Mutable<T> = {
+  -readonly [P in keyof T]: T[P];
+};
+
+
+================================================================================
+  KONETS FAYLOV
+  Vsego obrabotano failov: 30
+  Isklyuchena papka: src/generated
+================================================================================

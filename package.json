@@ -1,0 +1,43 @@
+{
+  "name": "pump-scout-bot",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "description": "Binance Futures pump detection bot",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "build": "tsc",
+    "start": "node dist/main.js",
+    "lint": "eslint src/**/*.ts",
+    "lint:fix": "eslint src/**/*.ts --fix",
+    "format": "prettier --write src/**/*.ts",
+    "format:all": "prettier --write \"**/*.{ts,js,json,md}\" --ignore-path .gitignore"
+  },
+  "dependencies": {
+    "class-transformer": "^0.5.1",
+    "class-validator": "^0.14.1",
+    "dotenv": "^16.4.0",
+    "express": "^5.1.0",
+    "node-telegram-bot-api": "^0.64.0",
+    "reflect-metadata": "^0.2.2",
+    "sqlite3": "^5.1.6",
+    "tsx": "^4.16.0",
+    "typeorm": "^0.3.20",
+    "typescript": "^5.5.0",
+    "winston": "^3.13.0",
+    "winston-daily-rotate-file": "^5.0.0",
+    "ws": "^8.17.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.5",
+    "@types/node-telegram-bot-api": "^0.64.0",
+    "@types/winston": "^2.4.4",
+    "@types/ws": "^8.5.10",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "eslint": "^8.56.0",
+    "eslint-config-airbnb-typescript": "^18.0.0",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-plugin-import": "^2.29.0",
+    "prettier": "^3.2.0"
+  }
+}
