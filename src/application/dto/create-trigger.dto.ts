@@ -1,5 +1,5 @@
-import { IsInt, IsNumber, IsPositive, Min, Max, IsIn } from 'class-validator';
-import { Direction } from '../../domain/types/direction.type';
+import { Direction } from '@domain/types/direction.type';
+import { IsIn, IsInt, IsNumber, IsPositive, Max, Min } from 'class-validator';
 
 export class CreateTriggerDto {
   userId!: number;
@@ -7,11 +7,11 @@ export class CreateTriggerDto {
   @IsIn(['up', 'down'])
   direction!: Direction;
 
-  @IsNumber({}, { message: 'Процент изменения ОИ должен быть числом' })
-  @IsPositive({ message: 'Процент изменения ОИ должен быть положительным' })
+  @IsNumber({}, { message: 'Процент изменения OI должен быть числом' })
+  @IsPositive({ message: 'Процент изменения OI должен быть положительным' })
   @Min(0.1)
   @Max(100)
-  oiChangePercent!: number;
+  oiChangePercent!: number; // primary field (was priceChangePercent)
 
   @IsInt({ message: 'Интервал должен быть целым числом' })
   @IsPositive({ message: 'Интервал должен быть положительным' })

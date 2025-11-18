@@ -3,7 +3,6 @@ import 'reflect-metadata';
 import express from 'express';
 import type { Request, Response } from 'express';
 
-
 import { config } from 'dotenv';
 import { DIContainer } from './shared/container';
 import { DatabaseModule } from './infrastructure/database/database.module';
@@ -16,9 +15,7 @@ config();
 // Import all necessary classes to ensure decorators are executed
 import './infrastructure/repositories/signal.repository';
 import './infrastructure/repositories/symbol-metadata.repository';
-import './infrastructure/services/binance-websocket.service';
 import './infrastructure/telegram/telegram.bot';
-import './infrastructure/http/binance-api.client';
 import './presentation/telegram/handlers/command.handler';
 import './presentation/telegram/handlers/signal.handler';
 

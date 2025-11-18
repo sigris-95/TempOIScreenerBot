@@ -51,6 +51,19 @@ export class SignalRepository implements ISignalRepository {
     );
   }
 
+  async getLast24HoursSignalCountByTriggerAndSymbol(
+    triggerId: number,
+    symbol: string,
+  ): Promise<number> {
+    const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    return this.repository
+      .createQueryBuilder('signal')
+      .where('signal.triggerId = :triggerId', { triggerId })
+      .andWhere('signal.symbol = :symbol', { symbol })
+      .andWhere('signal.createdAt >= :date', { date: twentyFourHoursAgo })
+      .getCount();
+  }
+
   // NEW: Get signal statistics for debugging
   async getSignalStats(userId: number): Promise<{
     total24h: number;

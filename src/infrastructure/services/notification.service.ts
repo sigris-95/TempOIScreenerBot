@@ -2,7 +2,7 @@ import { Inject, Injectable } from '../../shared/decorators';
 import { INotificationService, IMetricChanges } from '../../domain/interfaces/services.interface';
 import { ISignalRepository } from '../../domain/interfaces/repositories.interface';
 import { Trigger } from '../../domain/entities/trigger.entity';
-import { SignalDto, SignalQuality } from '../../application/dto/signal.dto';
+import { SignalDto } from '../../application/dto/signal.dto';
 import { SignalHandler } from '../../presentation/telegram/handlers/signal.handler';
 import { Logger } from '../../shared/logger';
 
@@ -11,11 +11,18 @@ export class NotificationService implements INotificationService {
   private readonly logger = new Logger(NotificationService.name);
   private readonly notificationCooldowns = new Map<string, number>();
 
+  // ✅ NEW: Track consecutive fires for exponential backoff
+  private readonly consecutiveFires = new Map<string, number>();
+  private readonly MAX_BACKOFF_MULTIPLIER = 8; // Max 8x cooldown
+
   constructor(
     private readonly signalHandler: SignalHandler,
     @Inject('ISignalRepository')
     private readonly signalRepository: ISignalRepository,
-  ) {}
+  ) {
+    // ✅ NEW: Cleanup old cooldowns every 10 minutes
+    setInterval(() => this.cleanupCooldowns(), 10 * 60 * 1000);
+  }
 
   public async processTrigger(
     trigger: Trigger,
@@ -26,65 +33,97 @@ export class NotificationService implements INotificationService {
     const lastNotification = this.notificationCooldowns.get(cooldownKey);
     const now = Date.now();
 
-    if (lastNotification && now - lastNotification < trigger.notificationLimitSeconds * 1000) {
-      return;
-    }
+    // ✅ FIX: Dynamic cooldown with exponential backoff
+    const consecutiveCount = this.consecutiveFires.get(cooldownKey) || 0;
+    const dynamicCooldown = this.calculateCooldown(trigger.notificationLimitSeconds, consecutiveCount);
 
-    this.logger.info(
-      `Trigger #${trigger.id} fired for user ${trigger.userId} on symbol ${symbol}. OI change: ${metrics.oiChangePercent.toFixed(2)}%`,
-    );
-
-    this.notificationCooldowns.set(cooldownKey, now);
-
-    const deltaPercent = metrics.oiChangePercent - metrics.priceChangePercent;
-
-    // Quality scoring
-    const absoluteStrength = Math.min(Math.abs(metrics.oiChangePercent) / 10, 1.0);
-    const alignment =
-      1 - Math.min(Math.abs(deltaPercent) / (Math.abs(metrics.oiChangePercent) + 0.1), 1);
-    const deltaStrength =
-      deltaPercent > 0 ? Math.min(deltaPercent / 5, 1.0) : Math.max(1 + deltaPercent / 10, 0.3);
-
-    const qualityScore = Math.min(
-      1,
-      0.6 * absoluteStrength + 0.3 * alignment + 0.1 * deltaStrength,
-    );
-
-    let quality: SignalQuality;
-    if (qualityScore > 0.7) quality = 'strong';
-    else if (qualityScore > 0.4) quality = 'medium';
-    else quality = 'weak';
-
-    // FIXED: Don't query for signal count here - SignalHandler will do it
-    // This was causing double database queries!
-
-    // Use price from metrics (same calculation that triggered the alert)
-    const currentPrice = metrics.currentPrice > 0 ? metrics.currentPrice : 0;
-
-    if (currentPrice === 0) {
-      this.logger.error(
-        `🚨 ZERO PRICE BUG DETECTED! Symbol: ${symbol}, ` +
-          `OI Change: ${metrics.oiChangePercent.toFixed(2)}%, ` +
-          `Price Change: ${metrics.priceChangePercent.toFixed(2)}%, ` +
-          `CurrentOI: ${metrics.currentOI}, ` +
-          `Trigger: #${trigger.id}`,
+    if (lastNotification && now - lastNotification < dynamicCooldown) {
+      const remaining = Math.ceil((dynamicCooldown - (now - lastNotification)) / 1000);
+      this.logger.debug(
+        `⏰ Cooldown active for ${symbol} (${remaining}s remaining, fires: ${consecutiveCount})`,
       );
       return;
     }
 
-    // FIXED: Pass 0 as signal number - SignalHandler will set the correct one
+    // ✅ FIX: Increment consecutive fire counter
+    this.consecutiveFires.set(cooldownKey, consecutiveCount + 1);
+
+    // Log primary metric (OI)
+    this.logger.info(
+      `Trigger #${trigger.id} fired for ${symbol}. OI change: ${metrics.oiChangePercent.toFixed(2)}% ` +
+      `(consecutive: ${consecutiveCount + 1}, cooldown: ${dynamicCooldown / 1000}s)`,
+    );
+
+    this.notificationCooldowns.set(cooldownKey, now);
+
+    this.logger.debug(
+      `📤 Preparing signal for user ${trigger.userId}: ${symbol} OI:${metrics.oiChangePercent.toFixed(2)}%`,
+    );
+
+    // Build SignalDto (OI primary, price secondary)
     const signalDto = new SignalDto(
-      0, // Placeholder - SignalHandler will query and set correct number
+      0,
       symbol,
-      metrics.priceChangePercent,
       metrics.oiChangePercent,
-      deltaPercent,
-      currentPrice,
+      metrics.oiStart,
+      metrics.oiEnd,
+      metrics.totalVolume,
+      metrics.deltaVolume,
+      metrics.priceChangePercent ?? 0,
+      metrics.currentPrice ?? 0,
+      metrics.previousPrice ?? 0,
       new Date(),
-      quality,
       trigger.timeIntervalMinutes,
     );
 
-    await this.signalHandler.handleSignal(signalDto, [trigger.userId], trigger.timeIntervalMinutes);
+    await this.signalHandler.handleSignal(
+      signalDto,
+      trigger.id,
+      trigger.userId,
+      trigger.timeIntervalMinutes,
+    );
+  }
+
+  // ✅ NEW: Calculate dynamic cooldown with exponential backoff
+  private calculateCooldown(baseCooldownSeconds: number, consecutiveFires: number): number {
+    if (consecutiveFires === 0) {
+      return baseCooldownSeconds * 1000;
+    }
+
+    // Exponential backoff: 1x -> 1.5x -> 2.25x -> 3.375x ... (max 8x)
+    const backoffMultiplier = Math.min(
+      Math.pow(1.5, consecutiveFires),
+      this.MAX_BACKOFF_MULTIPLIER,
+    );
+
+    return baseCooldownSeconds * 1000 * backoffMultiplier;
+  }
+
+  // ✅ NEW: Cleanup old cooldowns to prevent memory leak
+  private cleanupCooldowns(): void {
+    const now = Date.now();
+    const staleThreshold = 60 * 60 * 1000; // 1 hour
+
+    let cleaned = 0;
+    for (const [key, lastNotification] of this.notificationCooldowns.entries()) {
+      if (now - lastNotification > staleThreshold) {
+        this.notificationCooldowns.delete(key);
+        this.consecutiveFires.delete(key);
+        cleaned++;
+      }
+    }
+
+    if (cleaned > 0) {
+      this.logger.debug(
+        `🧹 Cleaned ${cleaned} stale cooldowns. Active: ${this.notificationCooldowns.size}`,
+      );
+    }
+  }
+
+  // ✅ NEW: Reset consecutive fires for a symbol (call when price stabilizes)
+  public resetConsecutiveFires(userId: number, symbol: string): void {
+    const key = `${userId}-${symbol}`;
+    this.consecutiveFires.delete(key);
+    this.logger.debug(`Reset consecutive fires for ${symbol}`);
   }
 }

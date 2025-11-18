@@ -15,41 +15,47 @@ export class SignalHandler {
     private readonly signalRepository: ISignalRepository,
   ) {}
 
-  async handleSignal(signalDto: SignalDto, userIds: number[], triggerIntervalMinutes?: number): Promise<void> {
+  async handleSignal(
+    signalDto: SignalDto,
+    triggerId: number,
+    userId: number,
+    triggerIntervalMinutes?: number,
+  ): Promise<void> {
     try {
-      // ✅ CORRECT: Query per-symbol count for each user
-      for (const userId of userIds) {
-        // Get the signal count for THIS SPECIFIC SYMBOL in last 24 hours
-        const signalCount = await this.signalRepository.getLast24HoursSignalCountBySymbol(
-          userId,
-          signalDto.symbol,
-        );
+      const signalCount = await this.signalRepository.getLast24HoursSignalCountByTriggerAndSymbol(
+        triggerId,
+        signalDto.symbol,
+      );
 
-        // Create signal entity with correct per-symbol number
-        const signal = new Signal();
-        signal.signalNumber = signalCount + 1;
-        signal.symbol = signalDto.symbol;
-        signal.priceChangePercent = signalDto.priceChangePercent;
-        signal.oiGrowthPercent = signalDto.oiGrowthPercent;
-        signal.deltaPercent = signalDto.deltaPercent;
-        signal.currentPrice = signalDto.currentPrice;
+      this.logger.debug(
+        `Trigger #${triggerId}: Found ${signalCount} previous signals, assigning number ${signalCount + 1}`,
+      );
 
-        // Save to database
-        await this.signalRepository.save(signal);
+      const signal = new Signal();
+      signal.signalNumber = signalCount + 1;
+      signal.triggerId = triggerId;
+      signal.symbol = signalDto.symbol;
+      // store both OI (primary) and price (secondary)
+      // @ts-ignore
+      signal.oiChangePercent = signalDto.oiChangePercent ?? 0;
+      // @ts-ignore
+      signal.priceChangePercent = signalDto.priceChangePercent ?? null;
+      signal.currentPrice = signalDto.currentPrice ?? null;
 
-        // Send to Telegram with correct number
-        await this.telegramBotService.sendSignal(
-          userId, 
-          {
-            ...signalDto,
-            signalNumber: signalCount + 1,
-            timestamp: new Date(),
-          },
-          triggerIntervalMinutes  // ← ADD THIS LINE
-        );
-      }
+      await this.signalRepository.save(signal);
 
-      this.logger.info(`Signal sent for ${signalDto.symbol}`);
+      // send telegram message
+      await this.telegramBotService.sendSignal(
+        userId,
+        {
+          ...signalDto,
+          signalNumber: signalCount + 1,
+          timestamp: new Date(),
+        },
+        triggerIntervalMinutes,
+      );
+
+      this.logger.info(`Signal sent for ${signalDto.symbol} (trigger #${triggerId})`);
     } catch (error) {
       this.logger.error('Error handling signal:', error);
     }

@@ -15,6 +15,7 @@ export interface ITriggerRepository {
 
 export interface ISignalRepository {
   getLast24HoursSignalCount(userId: number): Promise<number>;
+  getLast24HoursSignalCountByTriggerAndSymbol(triggerId: number, symbol: string): Promise<number>;
   getLast24HoursSignalCountBySymbol(userId: number, symbol: string): Promise<number>;
   save(signal: Signal): Promise<Signal>;
   findRecentBySymbol(symbol: string, hours: number): Promise<Signal[]>;

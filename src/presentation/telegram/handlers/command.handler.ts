@@ -9,6 +9,8 @@ import { validate } from 'class-validator';
 import { Logger } from '../../../shared/logger';
 import { Direction } from '../../../domain/types/direction.type';
 import { Trigger } from '../../../domain/entities/trigger.entity';
+import { PumpScoutBot } from '../../../app';
+import { UptimeService } from '../../../infrastructure/services/uptime.service';
 
 @Injectable()
 export class CommandHandler {
@@ -20,6 +22,7 @@ export class CommandHandler {
     private readonly createTriggerUseCase: CreateTriggerUseCase,
     private readonly getTriggersUseCase: GetTriggersUseCase,
     private readonly removeTriggerUseCase: RemoveTriggerUseCase,
+    private readonly uptimeService: UptimeService,
   ) {
     this.bot = this.telegramBotService.getBot();
   }
@@ -28,30 +31,54 @@ export class CommandHandler {
     this.bot.onText(/\/start/, this.handleStart.bind(this));
     this.bot.onText(/\/add/, this.handleAddTrigger.bind(this));
     this.bot.onText(/\/my_triggers/, this.handleMyTriggers.bind(this));
+    // ADD: New uptime command
+    this.bot.onText(/\/uptime/, this.handleUptime.bind(this));
+    this.bot.onText(/\/status/, this.handleUptime.bind(this)); // Alias
     this.bot.on('callback_query', this.handleCallbackQuery.bind(this));
     this.logger.info('Telegram command handlers initialized.');
   }
 
+  private async handleUptime(msg: TelegramBot.Message): Promise<void> {
+    const chatId = msg.chat.id;
+    const uptime = this.uptimeService.getUptime();
+
+    const activeTriggers = await this.getTriggersUseCase.execute(msg.from?.id || 0);
+
+    const statusMessage = `
+🤖 <b>Bot Status</b>
+
+⏱️ <b>Uptime:</b> ${uptime}
+🎯 <b>Your Active Triggers:</b> ${activeTriggers.length}
+📊 <b>System:</b> Online & Monitoring
+
+<i>Use /my_triggers to manage your alerts</i>
+    `.trim();
+
+    await this.telegramBotService.sendMessage(chatId, statusMessage);
+  }
+
   private async handleStart(msg: TelegramBot.Message): Promise<void> {
     const chatId = msg.chat.id;
-    const welcomeMessage = `
-👋 <b>Добро пожаловать в Pump Scout Bot!</b>
+    const uptime = this.uptimeService.getUptime();
 
-Я слежу за аномальными изменениями <b>Открытого Интереса (ОИ)</b> по всем USDT парам.
+    const welcomeMessage = `
+👋 <b>Добро пожаловать в OI Alert Bot!</b>
+
+Я отслеживаю изменения Open Interest (OI) в реальном времени по всем USDT парам.
 
 <b>Как создать триггер:</b>
-Отправьте команду в формате:
-<code>/add [up/down] [ОИ %] [интервал мин] [кулдаун сек]</code>
+<code>/add [up/down] [OI %] [интервал мин] [кулдаун сек]</code>
 
 <b>Пример:</b>
-<code>/add up 10 15 60</code>
-(Уведомить, если <b>ОИ</b> вырастет на <b>10%</b> за <b>15 минут</b>. Кулдаун уведомлений <b>60 секунд</b>)
+<code>/add up 5 15 60</code>
+(Уведомить, если OI вырастет на 5% за 15 минут. Кулдаун 60 секунд)
 
-В уведомлении также будет указано изменение цены за этот же период.
+<b>Команды:</b>
+/add - Создать триггер
+/my_triggers - Ваши триггеры
+/uptime - Статус бота
 
-<b>Доступные команды:</b>
-/add - Создать новый триггер
-/my_triggers - Ваши активные триггеры
+<i>Бот работает уже: ${uptime}</i>
     `.trim();
     await this.telegramBotService.sendMessage(chatId, welcomeMessage);
   }
@@ -72,10 +99,12 @@ export class CommandHandler {
       return;
     }
 
+    // Fix variable names
     const [, direction, oiPercent, interval, limit] = parts;
     const dto = new CreateTriggerDto();
     dto.userId = userId;
     dto.direction = direction as Direction;
+    // Use OI field
     dto.oiChangePercent = parseFloat(oiPercent);
     dto.timeIntervalMinutes = parseInt(interval, 10);
     dto.notificationLimitSeconds = parseInt(limit, 10);
@@ -93,7 +122,12 @@ export class CommandHandler {
       await this.createTriggerUseCase.execute(dto);
       await this.telegramBotService.sendMessage(
         chatId,
-        '✅ Триггер на изменение ОИ успешно создан!',
+        '✅ Триггер на изменение OI успешно создан!',
+      );
+
+      // ADD: Debug log for successful trigger creation
+      this.logger.debug(
+        `➕ User ${userId} created trigger: ${direction} ${oiPercent}% over ${interval}m`,
       );
     } catch (error) {
       this.logger.error('Failed to create trigger:', error);
@@ -135,7 +169,7 @@ export class CommandHandler {
 
   private formatTrigger(trigger: Trigger): string {
     const directionEmoji = trigger.direction === 'up' ? '📈' : '📉';
-    return `${directionEmoji} #${trigger.id}: ОИ на <b>${trigger.oiChangePercent}%</b> за <b>${trigger.timeIntervalMinutes} мин.</b> (кулдаун ${trigger.notificationLimitSeconds} сек)`;
+    return `${directionEmoji} #${trigger.id}: OI на <b>${trigger.oiChangePercent}%</b> за <b>${trigger.timeIntervalMinutes} мин.</b>`;
   }
 
   private async handleCallbackQuery(query: TelegramBot.CallbackQuery): Promise<void> {

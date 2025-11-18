@@ -14,7 +14,7 @@ export class PumpScoutBot {
     @Inject('ITriggerEngineService') private readonly triggerEngine: ITriggerEngineService,
     private readonly telegramBotService: TelegramBotService,
     @Inject('ITriggerRepository') private readonly triggerRepository: ITriggerRepository,
-    private readonly commandHandler: CommandHandler, // <-- Раскомментировали
+    private readonly commandHandler: CommandHandler,
   ) {}
 
   public async start(): Promise<void> {
@@ -28,9 +28,7 @@ export class PumpScoutBot {
       await this.marketDataGateway.connect();
       this.triggerEngine.start();
 
-      this.commandHandler.initialize(); // <-- Раскомментировали
-
-      this.telegramBotService.sendMessage(5200245605, 'Bot started')
+      this.commandHandler.initialize();
 
       this.logger.info('Pump Scout Bot started successfully!');
     } catch (error) {

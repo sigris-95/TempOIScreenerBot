@@ -1,5 +1,5 @@
-import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, Index } from 'typeorm';
-import { Direction } from '../types/direction.type';
+import { Direction } from '@domain/types/direction.type';
+import { Column, CreateDateColumn, Entity, Index, PrimaryGeneratedColumn } from 'typeorm';
 
 @Entity('triggers')
 export class Trigger {
@@ -14,7 +14,7 @@ export class Trigger {
   direction!: Direction;
 
   @Column({ name: 'oi_change_percent', type: 'real' })
-  oiChangePercent!: number;
+  oiChangePercent!: number; // primary threshold (was priceChangePercent)
 
   @Column({ name: 'time_interval_minutes', type: 'integer' })
   timeIntervalMinutes!: number;
