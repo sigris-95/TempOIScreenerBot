@@ -134,7 +134,7 @@ export class TelegramBotService {
     const baselineVolumeText = formatQuoteVolume(signal.volumeBaselineQuote ?? signal.volumeBaseline);
 
     return `
-🔔 <b>${signal.symbol}</b> · ${intervalDisplay}  
+🔔 №${signal.signalNumber || 1} · <b>${signal.symbol}</b> · ${intervalDisplay}
 💰 $${priceStr} (${priceSign}${priceValue.toFixed(2)}%) · ⏰ ${timeStr}
 
 ━━━━━━━━━━━━━━━━
