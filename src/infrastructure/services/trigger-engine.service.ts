@@ -19,9 +19,9 @@ import { UptimeService } from './uptime.service';
 // - debug logging behind env flag
 
 const BATCH_PROCESSING_SIZE = Number(process.env.BATCH_PROCESSING_SIZE) || 10;
-const PENDING_FLUSH_MS = Number(process.env.TRIGGER_ENGINE_FLUSH_MS) || 200; // flush pending symbols every X ms
+const PENDING_FLUSH_MS = Number(process.env.TRIGGER_ENGINE_FLUSH_MS) || 50; // flush pending symbols every 50ms (быстрее!)
 const METRIC_CACHE_TTL_MS = Number(process.env.TRIGGER_ENGINE_METRIC_CACHE_TTL_MS) || 500; // short local cache
-const DEFAULT_MIN_CHECK_INTERVAL_MS = Number(process.env.MIN_CHECK_INTERVAL_MS) || 1000; // base rate-limit
+const DEFAULT_MIN_CHECK_INTERVAL_MS = Number(process.env.MIN_CHECK_INTERVAL_MS) || 100; // проверка каждые 100ms (быстрее!)
 
 @Injectable()
 export class TriggerEngineService implements ITriggerEngineService {
@@ -33,9 +33,9 @@ export class TriggerEngineService implements ITriggerEngineService {
 
   // timing and state maps
   private lastCheckTime = new Map<string, number>(); // last attempt time for check (per trigger+symbol)
-  private lastNotificationTime = new Map<string, number>(); // last notification time (per trigger+symbol)
   private runningChecks = new Set<string>(); // currently running checks keys
-  private consecutiveFires = new Map<string, number>(); // consecutive fire counts
+  // REMOVED: lastNotificationTime (дублирует кулдаун в NotificationService)
+  // REMOVED: consecutiveFires (убрали экспоненциальный бэкофф)
 
   // metric local cache: `${symbol}_${interval}` -> { ts, metrics }
   private metricCache = new Map<string, { ts: number; metrics: any }>();
@@ -46,7 +46,7 @@ export class TriggerEngineService implements ITriggerEngineService {
 
   // configuration knobs
   private readonly MIN_CHECK_INTERVAL_MS = DEFAULT_MIN_CHECK_INTERVAL_MS;
-  private readonly DEBOUNCE_THRESHOLD = Number(process.env.TRIGGER_ENGINE_DEBOUNCE_THRESHOLD) || 3;
+  // REMOVED: DEBOUNCE_THRESHOLD (убрали экспоненциальный бэкофф)
 
   constructor(
     @Inject('ITriggerRepository') private readonly triggerRepository: ITriggerRepository,
@@ -84,9 +84,7 @@ export class TriggerEngineService implements ITriggerEngineService {
 
     this.pendingSymbols.clear();
     this.lastCheckTime.clear();
-    this.lastNotificationTime.clear();
     this.runningChecks.clear();
-    this.consecutiveFires.clear();
     this.metricCache.clear();
 
     this.logger.info('TriggerEngineService stopped');
@@ -176,11 +174,9 @@ export class TriggerEngineService implements ITriggerEngineService {
     const checkKey = `${trigger.id}-${symbol}`;
     const now = Date.now();
 
-    const fireCount = this.consecutiveFires.get(checkKey) || 0;
-    const dynamicInterval = this.calculateCheckInterval(fireCount);
-
+    // Простая проверка интервала без экспоненциального бэкоффа
     const last = this.lastCheckTime.get(checkKey) || 0;
-    if (now - last < dynamicInterval) return;
+    if (now - last < this.MIN_CHECK_INTERVAL_MS) return;
 
     if (this.runningChecks.has(checkKey)) return;
 
@@ -226,8 +222,6 @@ export class TriggerEngineService implements ITriggerEngineService {
       }
 
       if (!metrics) {
-        // no data => reset consecutive fires
-        this.consecutiveFires.delete(checkKey);
         if (this.isDebug()) this.logger.debug(`No metrics for ${symbol}@${trigger.timeIntervalMinutes}m`);
         return;
       }
@@ -238,35 +232,17 @@ export class TriggerEngineService implements ITriggerEngineService {
       }
 
       if (this.shouldTriggerFire(trigger, metrics)) {
-        const prev = this.consecutiveFires.get(checkKey) || 0;
-        const nowCount = prev + 1;
-        this.consecutiveFires.set(checkKey, nowCount);
+        this.logger.info(`🎯 Trigger ${trigger.id} fired for ${symbol} (OI: ${metrics.oiChangePercent.toFixed(2)}%)`);
 
-        this.logger.info(`Trigger ${trigger.id} fired for ${symbol} (count=${nowCount})`);
-
-        // notification cooldown: don't notify more often than notificationLimitSeconds
-        const notifKey = `${trigger.id}_${symbol}`;
-        const lastNotified = this.lastNotificationTime.get(notifKey) || 0;
-        const cooldownMs = (trigger.notificationLimitSeconds || 0) * 1000;
-        const now = Date.now();
-
-        if (cooldownMs > 0 && now - lastNotified < cooldownMs) {
-          if (this.isDebug()) this.logger.debug(`Cooldown active for ${notifKey}, skipping send`);
-        } else {
-          this.lastNotificationTime.set(notifKey, Date.now());
-          try {
-            await this.notificationService.processTrigger(trigger, symbol, metrics);
-          } catch (err) {
-            this.logger.error(`notificationService failed for trigger=${trigger.id} symbol=${symbol}:`, err);
-          }
+        // Отправляем в NotificationService - там уже есть кулдаун!
+        try {
+          await this.notificationService.processTrigger(trigger, symbol, metrics);
+        } catch (err) {
+          this.logger.error(`notificationService failed for trigger=${trigger.id} symbol=${symbol}:`, err);
         }
-      } else {
-        // reset consecutive count
-        this.consecutiveFires.delete(checkKey);
       }
     } catch (err) {
       this.logger.error(`Error checking trigger ${trigger.id} for ${symbol}:`, err);
-      this.consecutiveFires.delete(checkKey);
     }
   }
 
@@ -280,13 +256,6 @@ export class TriggerEngineService implements ITriggerEngineService {
 
     // down: actual is usually negative, threshold is positive
     return actual <= -Math.abs(threshold);
-  }
-
-  // dynamic check interval/backoff based on consecutive fires
-  private calculateCheckInterval(consecutiveFireCount: number): number {
-    if (consecutiveFireCount < this.DEBOUNCE_THRESHOLD) return this.MIN_CHECK_INTERVAL_MS;
-    const power = Math.min(consecutiveFireCount - this.DEBOUNCE_THRESHOLD + 1, 8);
-    return this.MIN_CHECK_INTERVAL_MS * Math.pow(2, power - 1);
   }
 
   private logHealth(): void {
@@ -315,19 +284,14 @@ export class TriggerEngineService implements ITriggerEngineService {
     for (const [k, ts] of Array.from(this.lastCheckTime.entries())) {
       if (now - ts > staleThreshold) {
         this.lastCheckTime.delete(k);
-        this.consecutiveFires.delete(k);
       }
     }
 
-    // also cleanup notification times a bit older
-    for (const [k, ts] of Array.from(this.lastNotificationTime.entries())) {
-      if (now - ts > 24 * 60 * 60 * 1000) this.lastNotificationTime.delete(k);
-    }
-
-    if (this.isDebug()) this.logger.debug(`Cleanup done: checks=${this.lastCheckTime.size} fires=${this.consecutiveFires.size}`);
+    if (this.isDebug()) this.logger.debug(`🧹 Cleanup done: checks=${this.lastCheckTime.size}`);
   }
 
   private isDebug(): boolean {
     return Boolean(process.env.DEBUG_TRIGGER_ENGINE);
   }
 }
+

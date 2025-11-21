@@ -23,6 +23,8 @@ export type MarketUpdatePayload = {
   volume?: number; // total volume in update (if only this is present)
   volumeBuy?: number; // buyer-initiated volume
   volumeSell?: number; // seller-initiated volume
+  volumeBuyQuote?: number; // buyer-initiated volume in quote currency
+  volumeSellQuote?: number; // seller-initiated volume in quote currency
   markPrice?: number;
   fundingRate?: number;
 };
@@ -38,6 +40,9 @@ type Bucket = {
   volumeBuy: number;
   volumeSell: number;
   totalVolume: number;
+  volumeBuyQuote: number;
+  volumeSellQuote: number;
+  totalQuoteVolume: number;
 
   // Price kept for price% calculations
   priceOpen: number | null;
@@ -187,6 +192,8 @@ export class DataAggregatorService implements IDataAggregatorService {
       volume: payload.volume,
       volumeBuy: payload.volumeBuy,
       volumeSell: payload.volumeSell,
+      volumeBuyQuote: payload.volumeBuyQuote,
+      volumeSellQuote: payload.volumeSellQuote,
     });
 
     // trigger engine: preserve original onPriceUpdate hook for compatibility
@@ -369,16 +376,18 @@ export class DataAggregatorService implements IDataAggregatorService {
     volume?: number;
     volumeBuy?: number;
     volumeSell?: number;
+    volumeBuyQuote?: number;
+    volumeSellQuote?: number;
   }): void {
-    const { timestamp: ts, price, openInterest, volume, volumeBuy, volumeSell } = point;
-    this.updateBucket(symbol, ts, { price, openInterest, volume, volumeBuy, volumeSell }, 15_000, this.buckets15s);
-    this.updateBucket(symbol, ts, { price, openInterest, volume, volumeBuy, volumeSell }, 60_000, this.buckets1m);
+    const { timestamp: ts, price, openInterest, volume, volumeBuy, volumeSell, volumeBuyQuote, volumeSellQuote } = point;
+    this.updateBucket(symbol, ts, { price, openInterest, volume, volumeBuy, volumeSell, volumeBuyQuote, volumeSellQuote }, 15_000, this.buckets15s);
+    this.updateBucket(symbol, ts, { price, openInterest, volume, volumeBuy, volumeSell, volumeBuyQuote, volumeSellQuote }, 60_000, this.buckets1m);
   }
 
   private updateBucket(
     symbol: string,
     ts: number,
-    payload: { price?: number; openInterest?: number; volume?: number; volumeBuy?: number; volumeSell?: number },
+    payload: { price?: number; openInterest?: number; volume?: number; volumeBuy?: number; volumeSell?: number; volumeBuyQuote?: number; volumeSellQuote?: number },
     bucketSize: number,
     store: Map<string, SortedBucketMap>,
   ): void {
@@ -396,6 +405,8 @@ export class DataAggregatorService implements IDataAggregatorService {
     const vol = Number.isFinite(payload.volume) ? payload.volume! : undefined;
     const volB = Number.isFinite(payload.volumeBuy) ? payload.volumeBuy! : 0;
     const volS = Number.isFinite(payload.volumeSell) ? payload.volumeSell! : 0;
+    const volBQ = Number.isFinite(payload.volumeBuyQuote) ? payload.volumeBuyQuote! : 0;
+    const volSQ = Number.isFinite(payload.volumeSellQuote) ? payload.volumeSellQuote! : 0;
 
     if (!b) {
       // initialize bucket with fallbacks
@@ -403,17 +414,21 @@ export class DataAggregatorService implements IDataAggregatorService {
       const initialPrice = price ?? this.lastKnownPrices.get(symbol);
 
       b = {
-        oiOpen: Number.isFinite(initialOI) ? initialOI : 0,
-        oiClose: Number.isFinite(initialOI) ? initialOI : 0,
-        oiHigh: Number.isFinite(initialOI) ? initialOI : -Infinity,
-        oiLow: Number.isFinite(initialOI) ? initialOI : Infinity,
+        // Если OI неизвестен, используем NaN — это позволит корректно обработать отсутствие данных
+        oiOpen: Number.isFinite(initialOI) ? initialOI : NaN,
+        oiClose: Number.isFinite(initialOI) ? initialOI : NaN,
+        oiHigh: Number.isFinite(initialOI) ? initialOI : NaN,
+        oiLow: Number.isFinite(initialOI) ? initialOI : NaN,
 
         volumeBuy: volB,
         volumeSell: volS,
-        totalVolume: vol ?? (volB + volS),
+        totalVolume: volB + volS, // Считаем ТОЛЬКО delta volume, без 24h ticker volume
+        volumeBuyQuote: volBQ,
+        volumeSellQuote: volSQ,
+        totalQuoteVolume: volBQ + volSQ,
 
-        priceOpen: initialPrice ?? null,  // ← ИСПРАВЛЕНО: добавлено ?? null
-        priceClose: initialPrice ?? null, // ← ИСПРАВЛЕНО: добавлено ?? null
+        priceOpen: initialPrice ?? null,
+        priceClose: initialPrice ?? null,
 
         count: 0,
         firstTs: ts,
@@ -446,20 +461,26 @@ export class DataAggregatorService implements IDataAggregatorService {
       b.lastTs = ts;
     }
 
-    // Update high/low for OI
+    // Update high/low for OI (только если значение валидное)
     if (Number.isFinite(oi)) {
-      b.oiHigh = Math.max(b.oiHigh, oi!);
-      b.oiLow = Math.min(b.oiLow, oi!);
+      if (Number.isNaN(b.oiHigh) || oi! > b.oiHigh) {
+        b.oiHigh = oi!;
+      }
+      if (Number.isNaN(b.oiLow) || oi! < b.oiLow) {
+        b.oiLow = oi!;
+      }
     }
 
-    // Update volumes
-    if (vol !== undefined) {
-      // only total volume is present: accumulate to totalVolume
-      b.totalVolume += vol;
-    }
-    // if buy/sell split provided, add them
+    // Update volumes - накапливаем ТОЛЬКО delta volume (volumeBuy/Sell)
+    // 24h volume из ticker больше НЕ используется
     if (volB) b.volumeBuy += volB;
     if (volS) b.volumeSell += volS;
+    if (volBQ) b.volumeBuyQuote += volBQ;
+    if (volSQ) b.volumeSellQuote += volSQ;
+    
+    // Пересчитываем total из buy+sell
+    b.totalVolume = b.volumeBuy + b.volumeSell;
+    b.totalQuoteVolume = b.volumeBuyQuote + b.volumeSellQuote;
 
     // ensure price open/close exist
     if (Number.isFinite(price)) {
@@ -538,26 +559,32 @@ export class DataAggregatorService implements IDataAggregatorService {
     const windowStart = now - durationMs;
     const windowEnd = now;
 
-    // Find movements within window: returns best OI up/down and aggregated volume
-    const movement = this.findOIAndVolumeWithinWindow(map, windowStart, windowEnd);
+    // Получаем OI и volume за окно
+    const movement = this.findOIAndVolumeWithinWindow(map, windowStart, windowEnd, bucketSize);
 
-    // If no OI movement and we have price data, fallback to price-based change (interpolation/fallback too)
     let oiChangePercent = 0;
-    let oiStart = movement?.oiStart ?? 0;
-    let oiEnd = movement?.oiEnd ?? 0;
-    let totalVolume = movement?.totalVolume ?? 0;
-    let deltaVolume = movement?.deltaVolume ?? 0;
+    let oiStart = 0;
+    let oiEnd = 0;
+    let totalVolume = 0;
+    let totalQuoteVolume = 0;
+    let deltaVolume = 0;
+    let deltaQuoteVolume = 0;
 
-    let priceChangePercent = 0;
-    let priceStart = 0;
-    let priceEnd = currentPrice ?? 0;
+    // Volume берем из movement (если есть) — он всегда агрегируется корректно
+    if (movement) {
+      totalVolume = movement.totalVolume;
+      deltaVolume = movement.deltaVolume;
+      totalQuoteVolume = movement.totalQuoteVolume;
+      deltaQuoteVolume = movement.deltaQuoteVolume;
+    }
 
+    // Для OI: сначала проверяем основной метод
     if (movement && movement.hasOI) {
       oiChangePercent = movement.oiChangePercent;
       oiStart = movement.oiStart;
       oiEnd = movement.oiEnd;
     } else {
-      // try fallback interpolation for OI (if any historical OI exists)
+      // try fallback interpolation для OI (если точных данных в окне нет, но есть рядом)
       if (map.getSortedKeys().length > 0) {
         const fallback = this.fallbackInterpolationForOI(map, windowStart, windowEnd, bucketSize, durationMs, minutes);
         if (fallback) {
@@ -567,6 +594,10 @@ export class DataAggregatorService implements IDataAggregatorService {
         }
       }
     }
+
+    let priceChangePercent = 0;
+    let priceStart = 0;
+    let priceEnd = currentPrice ?? 0;
 
     // Price%: compute from boundary prices (interpolate if needed)
     const startPrice = this.getPriceAtBoundary(map, windowStart);
@@ -586,6 +617,26 @@ export class DataAggregatorService implements IDataAggregatorService {
     }
 
     // Compose result
+    let volumeBaseline = 0;
+    let volumeBaselineQuote = 0;
+    let volumeRatio: number | null = null;
+    let volumeRatioQuote: number | null = null;
+
+    const previousWindowStart = windowStart - durationMs;
+    if (previousWindowStart >= 0) {
+      const prevMovement = this.findOIAndVolumeWithinWindow(map, previousWindowStart, windowStart, bucketSize);
+      if (prevMovement) {
+        volumeBaseline = prevMovement.totalVolume;
+        volumeBaselineQuote = prevMovement.totalQuoteVolume;
+        if (volumeBaseline > 0 && totalVolume > 0) {
+          volumeRatio = Number((totalVolume / volumeBaseline).toFixed(3));
+        }
+        if (volumeBaselineQuote > 0 && totalQuoteVolume > 0) {
+          volumeRatioQuote = Number((totalQuoteVolume / volumeBaselineQuote).toFixed(3));
+        }
+      }
+    }
+
     const result: any = {
       // OI metrics (primary)
       oiChangePercent: Number(oiChangePercent.toFixed(6)),
@@ -595,6 +646,12 @@ export class DataAggregatorService implements IDataAggregatorService {
       // Volume metrics
       totalVolume,
       deltaVolume, // buy - sell when available; 0 otherwise
+      totalQuoteVolume,
+      deltaQuoteVolume,
+      volumeBaseline,
+      volumeBaselineQuote,
+      volumeRatio,
+      volumeRatioQuote,
 
       // Price metrics (secondary)
       priceChangePercent: Number(priceChangePercent),
@@ -606,92 +663,52 @@ export class DataAggregatorService implements IDataAggregatorService {
     return result as IMetricChanges;
   }
 
-  // Find OI movements and aggregate volume within window (single pass)
+  // Расчет OI от начала окна к концу окна (как для цены) + агрегация volume
   private findOIAndVolumeWithinWindow(
     map: SortedBucketMap,
     windowStart: number,
     windowEnd: number,
+    bucketSize: number,
   ) {
     const keys = map.getSortedKeys();
     if (keys.length === 0) return null;
 
-    let seenAny = false;
-    let oiMin = Infinity;
-    let oiMinTs = 0;
-    let oiMax = -Infinity;
-    let oiMaxTs = 0;
-
-    let bestRise = 0;
-    let bestRiseStart = 0;
-    let bestRiseEnd = 0;
-    let bestRiseStartTs = 0;
-    let bestRiseEndTs = 0;
-
-    let bestDrop = 0;
-    let bestDropStart = 0;
-    let bestDropEnd = 0;
-    let bestDropStartTs = 0;
-    let bestDropEndTs = 0;
-
     let totalVolume = 0;
     let totalBuy = 0;
     let totalSell = 0;
-
+    let totalQuoteVolume = 0;
+    let totalQuoteBuy = 0;
+    let totalQuoteSell = 0;
     let priceFallbackStart: number | undefined;
+    let seenAny = false;
 
+    // Агрегируем volume за всё окно
     for (let i = 0; i < keys.length; i++) {
       const bucketTime = keys[i];
+      const bucketStart = bucketTime;
+      const bucketEnd = bucketStart + bucketSize;
 
-      if (bucketTime < windowStart) continue;
-      if (bucketTime > windowEnd) break;
+      if (bucketEnd <= windowStart) continue;
+      if (bucketStart >= windowEnd) break;
 
       const b = map.get(bucketTime)!;
       if (b.count === 0) continue;
 
+      const overlapStart = Math.max(windowStart, bucketStart);
+      const overlapEnd = Math.min(windowEnd, bucketEnd);
+      const overlapMs = Math.max(0, overlapEnd - overlapStart);
+      if (overlapMs <= 0) continue;
+
+      const ratio = bucketSize > 0 ? Math.min(1, overlapMs / bucketSize) : 1;
       seenAny = true;
 
-      // aggregate volume fields
-      totalVolume += (b.totalVolume ?? 0);
-      totalBuy += (b.volumeBuy ?? 0);
-      totalSell += (b.volumeSell ?? 0);
-
-      // OI extremes detection (if OI data is present inside bucket)
-      if (Number.isFinite(b.oiLow) && !isNaN(b.oiLow)) {
-        if (b.oiLow < oiMin) {
-          oiMin = b.oiLow;
-          oiMinTs = b.firstTs;
-        }
-      }
-      if (Number.isFinite(b.oiHigh) && !isNaN(b.oiHigh)) {
-        if (b.oiHigh > oiMax) {
-          oiMax = b.oiHigh;
-          oiMaxTs = b.firstTs;
-        }
-      }
-
-      // compute candidate rise: from minimum OI seen so far -> bucket's oiHigh
-      if (oiMin < Infinity && Number.isFinite(b.oiHigh)) {
-        const rise = ((b.oiHigh - oiMin) / oiMin) * 100;
-        if (rise > bestRise) {
-          bestRise = rise;
-          bestRiseStart = oiMin;
-          bestRiseEnd = b.oiHigh;
-          bestRiseStartTs = oiMinTs;
-          bestRiseEndTs = b.lastTs;
-        }
-      }
-
-      // compute candidate drop: from max OI seen so far -> bucket's oiLow
-      if (oiMax > -Infinity && Number.isFinite(b.oiLow)) {
-        const drop = ((oiMax - b.oiLow) / oiMax) * 100;
-        if (drop > bestDrop) {
-          bestDrop = drop;
-          bestDropStart = oiMax;
-          bestDropEnd = b.oiLow;
-          bestDropStartTs = oiMaxTs;
-          bestDropEndTs = b.lastTs;
-        }
-      }
+      // Накапливаем volume за окно
+      totalVolume += (b.totalVolume ?? 0) * ratio;
+      totalBuy += (b.volumeBuy ?? 0) * ratio;
+      totalSell += (b.volumeSell ?? 0) * ratio;
+      totalQuoteVolume += (b.totalQuoteVolume ?? 0) * ratio;
+      totalQuoteBuy += (b.volumeBuyQuote ?? 0) * ratio;
+      totalQuoteSell += (b.volumeSellQuote ?? 0) * ratio;
 
       // price fallback start: earliest bucket priceOpen in window
       if (priceFallbackStart === undefined && b.priceOpen !== null) {
@@ -701,55 +718,27 @@ export class DataAggregatorService implements IDataAggregatorService {
 
     if (!seenAny) return null;
 
-    const up = bestRise > 0 ? {
-      percent: Number(bestRise.toFixed(6)),
-      startPrice: bestRiseStart,
-      endPrice: bestRiseEnd,
-      duration: Math.max(1, Math.floor((bestRiseEndTs - bestRiseStartTs) / 1000)),
-      startTs: bestRiseStartTs,
-      endTs: bestRiseEndTs,
-    } : null;
+    // Получаем OI на границах окна (интерполяция, как для цены)
+    const oiStart = this.getOIAtBoundary(map, windowStart);
+    const oiEnd = this.getOIAtBoundary(map, windowEnd);
 
-    const down = bestDrop > 0 ? {
-      percent: Number(bestDrop.toFixed(6)),
-      startPrice: bestDropStart,
-      endPrice: bestDropEnd,
-      duration: Math.max(1, Math.floor((bestDropEndTs - bestDropStartTs) / 1000)),
-      startTs: bestDropStartTs,
-      endTs: bestDropEndTs,
-    } : null;
+    let hasOI = false;
+    let oiChangePercent = 0;
 
-    // choose the dominant OI movement by absolute percent (same semantics as v2)
-    let chosenPercent = 0;
-    let chosenStart = 0;
-    let chosenEnd = 0;
-    if (up && down) {
-      if (up.percent >= down.percent) {
-        chosenPercent = up.percent;
-        chosenStart = up.startPrice;
-        chosenEnd = up.endPrice;
-      } else {
-        chosenPercent = -down.percent; // negative indicates drop
-        chosenStart = down.startPrice;
-        chosenEnd = down.endPrice;
-      }
-    } else if (up) {
-      chosenPercent = up.percent;
-      chosenStart = up.startPrice;
-      chosenEnd = up.endPrice;
-    } else if (down) {
-      chosenPercent = -down.percent;
-      chosenStart = down.startPrice;
-      chosenEnd = down.endPrice;
+    if (oiStart !== null && oiEnd !== null && Number.isFinite(oiStart) && Number.isFinite(oiEnd) && oiStart > 0) {
+      hasOI = true;
+      oiChangePercent = Number((((oiEnd - oiStart) / oiStart) * 100).toFixed(6));
     }
 
     return {
-      hasOI: (oiMin !== Infinity && oiMax !== -Infinity),
-      oiChangePercent: chosenPercent,
-      oiStart: chosenStart,
-      oiEnd: chosenEnd,
+      hasOI,
+      oiChangePercent,
+      oiStart: oiStart ?? 0,
+      oiEnd: oiEnd ?? 0,
       totalVolume,
-      deltaVolume: (totalBuy && totalSell) ? (totalBuy - totalSell) : 0,
+      totalQuoteVolume,
+      deltaVolume: totalBuy - totalSell,
+      deltaQuoteVolume: totalQuoteBuy - totalQuoteSell,
       priceFallbackStart,
     };
   }
@@ -939,7 +928,7 @@ export class DataAggregatorService implements IDataAggregatorService {
   }
 
   private getOIAtBoundary(map: SortedBucketMap, boundary: number): number | null {
-    // Reuse same binary search logic as price but for OI fields
+    // Бинарный поиск для поиска bucket на границе окна (аналогично цене, но для OI)
     const keys = map.getSortedKeys();
     if (keys.length === 0) return null;
 
@@ -961,8 +950,10 @@ export class DataAggregatorService implements IDataAggregatorService {
 
     if (leftKey !== null && leftKey === rightKey) {
       const b = map.get(leftKey)!;
+      // Проверяем что OI значения валидны
+      if (!Number.isFinite(b.oiOpen) || !Number.isFinite(b.oiClose)) return null;
+      
       if (b.firstTs <= boundary && boundary <= b.lastTs) {
-        // interpolate between open/close OI by time
         return this.interpolate(b.firstTs, b.oiOpen, b.lastTs, b.oiClose, boundary);
       }
       if (boundary < b.firstTs) return b.oiOpen;
@@ -972,12 +963,16 @@ export class DataAggregatorService implements IDataAggregatorService {
     const leftBucket = leftKey !== null ? map.get(leftKey) : undefined;
     const rightBucket = rightKey !== null ? map.get(rightKey) : undefined;
 
-    if (leftBucket && leftBucket.firstTs <= boundary && boundary <= leftBucket.lastTs) {
-      return this.interpolate(leftBucket.firstTs, leftBucket.oiOpen, leftBucket.lastTs, leftBucket.oiClose, boundary);
+    if (leftBucket && Number.isFinite(leftBucket.oiOpen) && Number.isFinite(leftBucket.oiClose)) {
+      if (leftBucket.firstTs <= boundary && boundary <= leftBucket.lastTs) {
+        return this.interpolate(leftBucket.firstTs, leftBucket.oiOpen, leftBucket.lastTs, leftBucket.oiClose, boundary);
+      }
     }
 
-    if (rightBucket && rightBucket.firstTs <= boundary && boundary <= rightBucket.lastTs) {
-      return this.interpolate(rightBucket.firstTs, rightBucket.oiOpen, rightBucket.lastTs, rightBucket.oiClose, boundary);
+    if (rightBucket && Number.isFinite(rightBucket.oiOpen) && Number.isFinite(rightBucket.oiClose)) {
+      if (rightBucket.firstTs <= boundary && boundary <= rightBucket.lastTs) {
+        return this.interpolate(rightBucket.firstTs, rightBucket.oiOpen, rightBucket.lastTs, rightBucket.oiClose, boundary);
+      }
     }
 
     if (leftBucket && rightBucket) {
@@ -985,6 +980,14 @@ export class DataAggregatorService implements IDataAggregatorService {
       const prevOI = leftBucket.oiClose;
       const nextTime = rightBucket.firstTs;
       const nextOI = rightBucket.oiOpen;
+
+      // Проверяем валидность обоих значений
+      if (!Number.isFinite(prevOI) || !Number.isFinite(nextOI)) {
+        // Возвращаем то, что валидно
+        if (Number.isFinite(prevOI)) return prevOI;
+        if (Number.isFinite(nextOI)) return nextOI;
+        return null;
+      }
 
       if (prevTime <= boundary && boundary <= nextTime && nextTime > prevTime) {
         return this.interpolate(prevTime, prevOI, nextTime, nextOI, boundary);
@@ -995,8 +998,8 @@ export class DataAggregatorService implements IDataAggregatorService {
       return leftDelta <= rightDelta ? prevOI : nextOI;
     }
 
-    if (leftBucket) return leftBucket.oiClose;
-    if (rightBucket) return rightBucket.oiOpen;
+    if (leftBucket && Number.isFinite(leftBucket.oiClose)) return leftBucket.oiClose;
+    if (rightBucket && Number.isFinite(rightBucket.oiOpen)) return rightBucket.oiOpen;
 
     return null;
   }

@@ -15,6 +15,12 @@ export interface IMetricChanges {
   // Volume metrics
   readonly totalVolume?: number;
   readonly deltaVolume?: number;
+  readonly totalQuoteVolume?: number;
+  readonly deltaQuoteVolume?: number;
+  readonly volumeBaseline?: number;
+  readonly volumeBaselineQuote?: number;
+  readonly volumeRatio?: number | null;
+  readonly volumeRatioQuote?: number | null;
 
   // Secondary (price)
   readonly priceChangePercent?: number;

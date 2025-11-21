@@ -38,6 +38,7 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
   private ws: WebSocket | null = null;
   private connected = false;
   private reconnecting = false;
+  private intentionalDisconnect = false;
   private callback: PriceUpdateCallback | null = null;
 
   private usdtPerpetuals = new Set<string>();
@@ -45,6 +46,7 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
   private oiPollingTimer: NodeJS.Timeout | null = null;
 
   private aggTradeWsList: WebSocket[] = [];
+  private aggTradeReconnectTimers = new Set<NodeJS.Timeout>();
   private aggTradeCache = new Map<
     string,
     {
@@ -157,18 +159,19 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
         if (i + OI_BATCH_SIZE < symbols.length) await new Promise((r) => setTimeout(r, 60));
       }
 
-      // schedule next run by resetting timer externally — we keep an interval in startOiPolling; this calc is advisory
+      // reschedule next poll using dynamic interval
+      if (this.oiPollingTimer) clearTimeout(this.oiPollingTimer);
+      if (!this.intentionalDisconnect && this.connected) {
+        this.oiPollingTimer = setTimeout(() => poll().catch((e) => this.logger.debug('OI poll failed', e)), safeInterval);
+      }
     };
 
     // kick first run immediately
     poll().catch((e) => this.logger.debug('Initial OI poll failed', e));
-
-    if (this.oiPollingTimer) clearInterval(this.oiPollingTimer);
-    this.oiPollingTimer = setInterval(() => poll().catch((e) => this.logger.debug('OI poll failed', e)), OI_POLL_INTERVAL_MS_MIN);
   }
 
   private stopOiPolling(): void {
-    if (this.oiPollingTimer) clearInterval(this.oiPollingTimer);
+    if (this.oiPollingTimer) clearTimeout(this.oiPollingTimer);
     this.oiPollingTimer = null;
     this.oiCache.clear();
   }
@@ -195,7 +198,9 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
     ws.on('close', () => {
       if (closedByUs) return;
       this.logger.warn('AggTrade batch WS closed — reconnecting this batch in 3s');
-      setTimeout(() => {
+      const timer = setTimeout(() => {
+        this.aggTradeReconnectTimers.delete(timer);
+        if (this.intentionalDisconnect) return; // предотвращаем reconnect после disconnect
         try {
           const newWs = this.createAggTradeWS(batch);
           const idx = this.aggTradeWsList.indexOf(ws);
@@ -205,6 +210,7 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
           this.logger.error('Failed to recreate aggTrade ws', e);
         }
       }, 3000);
+      this.aggTradeReconnectTimers.add(timer);
     });
 
     // attach marker for graceful termination
@@ -221,7 +227,6 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
 
   private subscribeToAggTrades(): void {
     if (this.marketType !== 'futures') return;
-    if (this.aggSubscribed) return; // avoid duplicate subscribe calls
 
     // terminate existing batch sockets gracefully
     this.aggTradeWsList.forEach((s: any) => {
@@ -347,6 +352,7 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
         this.connected = true;
         this.reconnecting = false;
         this.reconnectAttempts = 0;
+        this.intentionalDisconnect = false; // разрешаем автоматический reconnect
         this.logger.info(`Connected to Binance ${this.marketType}`);
 
         if (this.marketType === 'futures') {
@@ -377,18 +383,28 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
       this.ws.on('close', () => {
         this.connected = false;
         this.logger.warn('Main connection closed');
-        this.handleReconnection().catch((e) => this.logger.error('Reconnection scheduling failed', e));
+        // только автоматический reconnect если не было намеренного disconnect
+        if (!this.intentionalDisconnect) {
+          this.handleReconnection().catch((e) => this.logger.error('Reconnection scheduling failed', e));
+        }
       });
     });
   }
 
   public async disconnect(): Promise<void> {
+    this.intentionalDisconnect = true; // предотвращаем автоматический reconnect
     this.connected = false;
+    this.reconnecting = false;
+    
     this.stopOiPolling();
 
     if (this.deltaFlushTimer) clearInterval(this.deltaFlushTimer);
     this.deltaFlushTimer = null;
     this.aggTradeCache.clear();
+
+    // очищаем все pending reconnect таймеры для aggTrade
+    this.aggTradeReconnectTimers.forEach((timer) => clearTimeout(timer));
+    this.aggTradeReconnectTimers.clear();
 
     this.aggTradeWsList.forEach((s: any) => {
       try {
@@ -467,8 +483,9 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
           symbol,
           price,
           timestamp: msg.E || now,
-          volume: msg.v ? parseFloat(msg.v) : undefined,
-          quoteVolume: msg.q ? parseFloat(msg.q) : undefined,
+          // НЕ передаем 24h volume из ticker — он смешивается с delta volume!
+          // volume: msg.v ? parseFloat(msg.v) : undefined,
+          // quoteVolume: msg.q ? parseFloat(msg.q) : undefined,
         };
 
         if (this.marketType === 'futures') {
@@ -490,7 +507,7 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
   }
 
   private async handleReconnection(): Promise<void> {
-    if (this.reconnecting) return;
+    if (this.reconnecting || this.intentionalDisconnect) return;
     this.reconnecting = true;
     this.reconnectAttempts++;
     const attempt = this.reconnectAttempts;
@@ -499,15 +516,22 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
 
     await new Promise((r) => setTimeout(r, backoff));
 
+    // проверяем еще раз после задержки
+    if (this.intentionalDisconnect) {
+      this.reconnecting = false;
+      return;
+    }
+
     try {
       await this.connect();
       this.reconnecting = false;
     } catch (e) {
       this.logger.error('Reconnection failed', e);
-      // allow next scheduled reconnection
       this.reconnecting = false;
-      // schedule another reconnect attempt with increased attempts counter
-      setTimeout(() => { this.handleReconnection().catch(() => {}); }, Math.min(backoff * 1.5, 60_000));
+      // schedule another reconnect attempt (счетчик уже увеличен выше)
+      if (!this.intentionalDisconnect) {
+        setTimeout(() => { this.handleReconnection().catch(() => {}); }, Math.min(backoff * 1.5, 60_000));
+      }
     }
   }
 }

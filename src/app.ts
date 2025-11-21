@@ -29,7 +29,7 @@ export class PumpScoutBot {
       this.triggerEngine.start();
 
       this.commandHandler.initialize();
-      this.telegramBotService.sendMessage(process.env.TG_USER ? parseInt(process.env.TG_USER) : 0, '🤖 Bot started');
+
       this.logger.info('Pump Scout Bot started successfully!');
     } catch (error) {
       this.logger.error('Failed to initialize Pump Scout Bot:', error);

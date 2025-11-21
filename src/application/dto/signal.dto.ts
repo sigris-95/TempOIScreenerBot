@@ -13,6 +13,12 @@ export class SignalDto {
     // Volume metrics
     public readonly totalVolume?: number,
     public readonly deltaVolume?: number, // buy - sell when available
+  public readonly totalQuoteVolume?: number,
+  public readonly deltaQuoteVolume?: number,
+  public readonly volumeBaseline?: number,
+  public readonly volumeBaselineQuote?: number,
+  public readonly volumeRatio?: number | null,
+  public readonly volumeRatioQuote?: number | null,
 
     // Secondary (auxiliary): price percent change
     public readonly priceChangePercent?: number,
