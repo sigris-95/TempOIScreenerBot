@@ -8,6 +8,7 @@ import { ITriggerRepository } from '../../domain/interfaces/repositories.interfa
 import { Trigger } from '../../domain/entities/trigger.entity';
 import { Logger } from '../../shared/logger';
 import { UptimeService } from './uptime.service';
+import { OIVelocityFilter } from '../../modules/decision-system/filters/oi-velocity.filter';
 
 // Backwards-compatible TriggerEngineService with optimisations:
 // - batched symbol processing (queue with debounce)
@@ -48,12 +49,16 @@ export class TriggerEngineService implements ITriggerEngineService {
   private readonly MIN_CHECK_INTERVAL_MS = DEFAULT_MIN_CHECK_INTERVAL_MS;
   // REMOVED: DEBOUNCE_THRESHOLD (убрали экспоненциальный бэкофф)
 
+  private readonly velocityFilter: OIVelocityFilter;
+
   constructor(
     @Inject('ITriggerRepository') private readonly triggerRepository: ITriggerRepository,
     @Inject('IDataAggregatorService') private readonly dataAggregator: IDataAggregatorService,
     @Inject('INotificationService') private readonly notificationService: INotificationService,
     private readonly uptimeService: UptimeService,
-  ) {}
+  ) {
+    this.velocityFilter = new OIVelocityFilter();
+  }
 
   public start(): void {
     if (this.isRunning) return;
@@ -231,7 +236,7 @@ export class TriggerEngineService implements ITriggerEngineService {
         this.logger.debug(`Eval trigger=${trigger.id} symbol=${symbol} interval=${trigger.timeIntervalMinutes}m actual OI=${pct}% currentPrice=${metrics.currentPrice}`);
       }
 
-      if (this.shouldTriggerFire(trigger, metrics)) {
+      if (this.shouldTriggerFire(trigger, metrics, symbol)) {
         this.logger.info(`🎯 Trigger ${trigger.id} fired for ${symbol} (OI: ${metrics.oiChangePercent.toFixed(2)}%)`);
 
         // Отправляем в NotificationService - там уже есть кулдаун!
@@ -246,16 +251,45 @@ export class TriggerEngineService implements ITriggerEngineService {
     }
   }
 
-  // Should fire: compare OI (primary)
-  private shouldTriggerFire(trigger: Trigger, metrics: { oiChangePercent: number; priceChangePercent?: number }): boolean {
+  // Should fire: compare OI (primary) + velocity filter
+  private shouldTriggerFire(trigger: Trigger, metrics: any, symbol: string): boolean {
     const actual = metrics?.oiChangePercent;
     if (!Number.isFinite(actual)) return false;
 
     const threshold = Number(trigger.oiChangePercent) || 0;
-    if (trigger.direction === 'up') return actual >= threshold;
+    const basicPass = trigger.direction === 'up'
+      ? actual >= threshold
+      : actual <= -Math.abs(threshold);
 
-    // down: actual is usually negative, threshold is positive
-    return actual <= -Math.abs(threshold);
+    if (!basicPass) return false;
+
+    // ВЕЛОСИТИ-ФИЛЬТР — ВСЁ РЕШАЕТ ЗДЕСЬ
+    const accessor = this.dataAggregator.createAccessor();
+    const velocityResult = this.velocityFilter.evaluate(
+      symbol,  // Use actual symbol from function parameter
+      accessor,
+      {
+        percent: trigger.oiChangePercent,
+        oiIntervalMin: trigger.timeIntervalMinutes,
+      }
+    );
+    console.log(`[VelocityFilter]: ${JSON.stringify(velocityResult)} | trigger ${trigger.id}`);
+    if (!velocityResult.pass) {
+      console.log(`[VelocityFilter] BLOCKED: ${velocityResult.reason} | trigger ${trigger.id}`);
+      if (this.isDebug()) {
+        this.logger.debug(`[VelocityFilter] BLOCKED: ${velocityResult.reason} | trigger ${trigger.id}`);
+      }
+      return false;
+    }
+
+    // Если ускоряется — можно добавить в метрики
+    if (velocityResult.tags?.includes('ACCELERATING')) {
+      metrics.velocity = velocityResult.velocity;
+      metrics.acceleration = velocityResult.acceleration;
+      metrics.velocityTags = velocityResult.tags;
+    }
+
+    return true;
   }
 
   private logHealth(): void {

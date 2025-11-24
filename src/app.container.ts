@@ -7,6 +7,8 @@ import { UptimeService } from './infrastructure/services/uptime.service';
 import { DataAggregatorService } from './infrastructure/services/data-aggregator.service';
 import { NotificationService } from './infrastructure/services/notification.service';
 import { TriggerEngineService } from './infrastructure/services/trigger-engine.service';
+import { DecisionCoordinator } from './modules/decision-system/decision-coordinator';
+import { LongShortDecisionEngine } from './modules/decision-system/engines/long-short-decision.engine';
 
 import { TelegramBotService } from './infrastructure/telegram/telegram.bot';
 import { CommandHandler } from './presentation/telegram/handlers/command.handler';
@@ -26,11 +28,15 @@ import { MarketDataGatewayService } from './infrastructure/market-data/market-da
 import { BinanceMarketDataProvider } from './infrastructure/market-data/providers/binance.provider';
 import { BybitMarketDataProvider } from './infrastructure/market-data/providers/bybit.provider';
 import { OKXMarketDataProvider } from './infrastructure/market-data/providers/okx.provider';
+import { HybridMarketDataProvider } from './infrastructure/market-data/providers/hybrid.provider';
 import {
   IMarketDataProvider,
   MarketType,
   ProviderConfig,
 } from './domain/interfaces/market-data-provider.interface';
+
+import { OIVelocityFilter } from './modules/decision-system/filters/oi-velocity.filter';
+
 import { Logger } from './shared/logger';
 
 const logger = new Logger('DependencyContainer');
@@ -57,9 +63,23 @@ export function registerDependencies(): void {
     () => new RemoveTriggerUseCase(container.get('ITriggerRepository')),
   );
 
+  // --- Register Filters ---
+  container.bind(OIVelocityFilter, () => new OIVelocityFilter());
+
   // --- Register Core Services & Handlers ---
   container.bind(UptimeService, () => new UptimeService());
   container.bind('IDataAggregatorService', () => new DataAggregatorService());
+
+  // --- Register Decision System ---
+  container.bind(LongShortDecisionEngine, () => new LongShortDecisionEngine());
+  container.bind(
+    DecisionCoordinator,
+    () =>
+      new DecisionCoordinator(
+        container.get('IDataAggregatorService'),
+        container.get(LongShortDecisionEngine),
+      ),
+  );
 
   // --- Configure Market Data Providers ---
   const providerConfigs = parseProviderConfigs();
@@ -235,6 +255,9 @@ function createProvider(config: ProviderConfig): IMarketDataProvider | null {
 
     case 'okx':
       return new OKXMarketDataProvider(marketType);
+
+    case 'hybrid':
+      return new HybridMarketDataProvider(marketType);
 
     default:
       return null;

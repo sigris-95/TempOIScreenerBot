@@ -1,8 +1,9 @@
 services:
   - type: web
-    name: pump-scout-bot
+    name: oi-creener-bot
     env: node
-    region: oregon
+    region: frankfurt
     plan: free
+    branch: v2
     buildCommand: npm install --build-from-source && npm run build
     startCommand: npm run start

@@ -217,7 +217,7 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
     Object.defineProperty(ws, '_closeGracefully', {
       value: () => {
         closedByUs = true;
-        try { ws.terminate(); } catch (e) {}
+        try { ws.terminate(); } catch (e) { }
       },
       writable: false,
     });
@@ -233,7 +233,7 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
       try {
         if (typeof s._closeGracefully === 'function') s._closeGracefully();
         else s.terminate();
-      } catch (e) {}
+      } catch (e) { }
     });
     this.aggTradeWsList = [];
 
@@ -395,7 +395,7 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
     this.intentionalDisconnect = true; // предотвращаем автоматический reconnect
     this.connected = false;
     this.reconnecting = false;
-    
+
     this.stopOiPolling();
 
     if (this.deltaFlushTimer) clearInterval(this.deltaFlushTimer);
@@ -410,13 +410,13 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
       try {
         if (typeof s._closeGracefully === 'function') s._closeGracefully();
         else s.terminate();
-      } catch (e) {}
+      } catch (e) { }
     });
     this.aggTradeWsList = [];
     this.aggSubscribed = false;
 
     if (this.ws) {
-      try { this.ws.terminate(); } catch (e) {}
+      try { this.ws.terminate(); } catch (e) { }
     }
     this.ws = null;
 
@@ -530,7 +530,7 @@ export class BinanceMarketDataProvider implements IMarketDataProvider {
       this.reconnecting = false;
       // schedule another reconnect attempt (счетчик уже увеличен выше)
       if (!this.intentionalDisconnect) {
-        setTimeout(() => { this.handleReconnection().catch(() => {}); }, Math.min(backoff * 1.5, 60_000));
+        setTimeout(() => { this.handleReconnection().catch(() => { }); }, Math.min(backoff * 1.5, 60_000));
       }
     }
   }
